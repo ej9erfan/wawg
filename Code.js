@@ -2446,6 +2446,17 @@ function generateWithoutDrivers() {
     // Adding 'return' ensures the timestamp reaches makeLabelsPDF
     return generateDeliveryLabels({ includeDriverNames: false });
 }
+
+function generateWithRoutes() {
+    // Adding 'return' ensures the timestamp reaches makeLabelsPDF
+    return generateDeliveryLabels({ includeRouteNames: true });
+}
+
+function generateWithAbbreviatedRoutes() {
+    // Adding 'return' ensures the timestamp reaches makeLabelsPDF
+    return generateDeliveryLabels({ includeAbbreviatedRouteNames: true });
+}
+
 // --- Constants for Label Dimensions (Avery 6240) ---
 const LABELS_PER_ROW = 3;
 const LABEL_HEIGHT_ROWS = 2; // 2 rows of Google Sheets = 1 physical label
@@ -2914,10 +2925,10 @@ function makeLabelsPDF() {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     
     // 1. CAPTURE THE TIMESTAMP from the first function
-    //const timestamp = makeTheLabels();
-    //const timestamp = generateDeliveryLabels();
-    const timestamp = generateWithoutDrivers();
+    //const timestamp = generateWithoutDrivers();
     //const timestamp = generateWithDrivers();
+    const timestamp = generateWithRoutes();
+    //const timestamp = generateWithAbbreviatedRoutes();
     
      
     
@@ -3064,7 +3075,9 @@ function onOpen() {
     .addToUi();
   ui.createMenu('📦 Label Generator')
       .addItem('Generate Labels (w/ Drivers, Continuous)', 'generateWithDrivers')
-      .addItem('Generate Labels (w/o Drivers, Continuous)', 'generateWithoutDrivers')
+      .addItem('Generate Labels (w/ Routes, Continuous)', 'generateWithRoutes')
+      .addItem('Generate Labels (w/ AbbreviatedRoutes, Continuous)', 'generateWithAbbreviatedRoutes')
+      .addItem('Generate Labels (w/o Drivers/Routes, Continuous)', 'generateWithoutDrivers')
     .addToUi();
   ui.createMenu("📦 Sheet Tools")
     .addItem('Delete Route Sheets', 'deleteSheetsByPrefix')
