@@ -1,93 +1,1106 @@
-function generateSpecialItemsCoordinator() {
+/**
+ * Automatically rebuilds the DeliveriesHelpTable from the source data.
+ * This ensures Driver names are always current before reports run.
+ */
+function refreshDeliveriesHelpTable() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sourceSheet = ss.getSheetByName("Deliveries-UPDATE HERE");
+  const helperSheetName = "DeliveriesHelpTable";
+  
+  // 1. Get or Create the helper sheet
+  let helperSheet = ss.getSheetByName(helperSheetName);
+  if (!helperSheet) {
+    helperSheet = ss.insertSheet(helperSheetName);
+  }
+  helperSheet.clear(); // Clear old data
+
+  // 2. Load Source Data
+  const data = sourceSheet.getDataRange().getValues();
+  const headers = data[0].map(h => String(h).trim());
+  const routeIdx = headers.indexOf("routeDescription");
+  const driverIdx = headers.indexOf("Driver");
+
+  if (routeIdx === -1 || driverIdx === -1) {
+    console.error("Could not find 'routeDescription' or 'Driver' columns in source.");
+    return;
+  }
+
+  // 3. Extract Unique Route -> Driver mapping
+  const mapping = {};
+  data.slice(1).forEach(row => {
+    const route = String(row[routeIdx] || "").trim();
+    const driver = String(row[driverIdx] || "").trim();
+    
+    // Only add if route isn't empty; update driver if one is found
+    if (route && (!mapping[route] || mapping[route] === "TBD" || mapping[route] === "")) {
+      mapping[route] = driver || "TBD";
+    }
+  });
+
+  // 4. Convert to array and sort by route (alphabetical)
+  const outputRows = [["routeDescription", "Driver"]];
+  Object.keys(mapping).sort().forEach(route => {
+    outputRows.push([route, mapping[route]]);
+  });
+
+  // 5. Write back to DeliveriesHelpTable
+  helperSheet.getRange(1, 1, outputRows.length, 2).setValues(outputRows);
+  helperSheet.getRange(1, 1, 1, 2).setFontWeight("bold").setBackground("#F0F0F0");
+  helperSheet.autoResizeColumns(1, 2);
+  
+  console.log("DeliveriesHelpTable refreshed successfully.");
+}
+
+// New drivers tab functions
+
+/***************
+ Batch 1: Controller + Data Loading / Grouping Helpers
+ (Drop-in replacement for the top of makeDriverRouteTabs)
+***************/
+
+function makeDriverRouteTabs() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  refreshDeliveriesHelpTable();
+  const DATA_SHEET_NAME = "Deliveries-UPDATE HERE";
+  const INDEX_SHEET_NAME = "Driver_Deliveries";
+  const ROUTE_SHEET_PREFIX = "Route_";
+  // const helperWriter = "buildRouteSheet"; // the per-route writer we'll call (Batch 2 will replace with new functions)
+  const helperWriter = "populateRouteTabs";
+
+  Logger.log("makeDriverRouteTabs: start");
+
+  // 1) cleanup old route sheets
+  cleanupPreviousRouteSheets(ss, ROUTE_SHEET_PREFIX);
+
+  // 2) load raw data + headers
+  const { dataSheet, headers, dataRows } = loadDriverRouteData(ss, DATA_SHEET_NAME);
+  if (!dataSheet || headers.length === 0) {
+    SpreadsheetApp.getUi().alert(`Data sheet "${DATA_SHEET_NAME}" not found or empty.`);
+    return;
+  }
+  if (dataRows.length === 0) {
+    SpreadsheetApp.getUi().alert("No data rows found in the data sheet.");
+    return;
+  }
+
+  // 3) apply confirmation filter (Conf for *)
+  const confForHeader = headers.find(h => typeof h === 'string' && h.trim().startsWith("Conf for"));
+  const confForIdx = confForHeader ? headers.indexOf(confForHeader) : -1;
+  const filteredRows = filterDriverRouteRows(dataRows, confForIdx);
+
+  // 4) helper mapping (route -> driver)
+  const routeDriverMap = buildRouteDriverMap(ss, "DeliveriesHelpTable");
+
+  // 5) group rows by route (object keyed by routeDescription)
+  const grouped = groupRowsByRoute(filteredRows, headers, "routeDescription");
+
+  // 6) gather route-level map links (pre-extraction for each route)
+  const routeMapInfo = {};
+  Object.keys(grouped).forEach(routeKey => {
+    routeMapInfo[routeKey] = extractMapLinkForRoute({
+      ss,
+      dataSheet,
+      headers,
+      dataRows,          // full data array (including header-less rows)
+      routeValue: routeKey,
+      deliveryMapColumnHeader: "Delivery Map Links"
+    });
+  });
+
+  // 7) orchestrate sheet creation using existing writer (populateRouteTabs)
+  // We'll call populateRouteTabs per route. Batch 2 will replace this with new builders.
+  const summaryRows = [["Route", "Driver", "Stops", "Open Sheet"]];
+  const routeNames = Object.keys(grouped).sort();
+
+  routeNames.forEach((route, idx) => {
+    const safeName = route.replace(/[^a-zA-Z0-9]/g, "_").substring(0, 30);
+    const sheetName = ROUTE_SHEET_PREFIX + safeName;
+    const routeColor = pickRouteColor(idx); // small utility below
+
+    const driverName = routeDriverMap[route] || "TBD";
+    const personStops = grouped[route].personStops;
+
+    // create new sheet
+    const sheet = ss.insertSheet(sheetName);
+    sheet.clearFormats();
+    try { sheet.setTabColor(routeColor); } catch(e) { /* ignore colors if invalid */ }
+
+    // map info for this route
+    const mapInfo = routeMapInfo[route] || { link: "", label: "" };
+
+    // Call the route writer (current code uses populateRouteTabs)
+    // Signature we expect (matches your old function):
+    // populateRouteTabs(ss, sheet, route, driver, personStops, itemMap, finalItemHeaders, headers, routeColor, allStopColors, colIndices, routeMapLink, routeMapLabel)
+    // We'll re-create the minimal param set here from the old code so existing populateRouteTabs keeps working.
+    try {
+      // Build a small column index object used by the existing populateRouteTabs
+      const colIndices = {
+        nameCol: headers.indexOf("Name"),
+        addressCol: headers.indexOf("Address"),
+        phoneCol: headers.indexOf("Phone"),
+        specCol: headers.indexOf("Special Item Requests"),
+        delivCol: headers.indexOf("Special Delivery Instructions")
+      };
+
+      // Build a simple itemMap + finalItemHeaders consistent with current implementation
+      const diapers1Idx = headers.indexOf("diapers1(size)");
+      const diapers2Idx = headers.indexOf("diapers2(size)");
+      const diapers3Idx = headers.indexOf("diapers3(size)");
+      const itemMap = [
+        { label: "food", sourceHeader: "# packs", type: 'qty' },
+        { label: "eggs", sourceHeader: "# eggs", type: 'qty' },
+        { label: "milk", sourceHeader: "# milk", type: 'qty' },
+        { label: "dog food", sourceHeader: "dogFood(qty)", type: 'qty' },
+        { label: "cat food", sourceHeader: "catFood(qty)", type: 'qty' },
+        { label: "diapers", sourceIndex: [diapers1Idx, diapers2Idx, diapers3Idx], type: 'diapers' },
+        { label: "wipes", sourceHeader: "wipes(qty)", type: 'qty' },
+        { label: "toiletries", sourceHeader: "toiletries(qty)", type: 'qty' },
+        { label: "fem hygn", sourceHeader: "fem hygiene(qty)", type: 'qty' },
+      ];
+      const finalItemHeaders = itemMap.map(i => i.label);
+
+      // call the writer
+      buildRouteSheet({
+        ss,
+        sheet,
+        route,
+        driverName,
+        personStops,
+        itemMap,
+        finalItemHeaders,
+        headers,
+        routeColor,
+        stopColors: pickStopColors(),
+        colIndices,
+        mapInfo
+      });
+
+      // Build index entry (with hyperlink to the sheet)
+      summaryRows.push([
+        route,
+        driverName,
+        Object.keys(personStops).length,
+        `=HYPERLINK("#gid=${sheet.getSheetId()}","Open")`
+      ]);
+    } catch (err) {
+      Logger.log(`Error writing route ${route}: ${err}`);
+      // remove the sheet if something failed to avoid half-created outputs
+      try { ss.deleteSheet(sheet); } catch (e) {}
+    }
+  });
+
+  // 8) Write index sheet
+  writeRouteIndexSheet(ss, INDEX_SHEET_NAME, summaryRows);
+
+  const finishedTimestamp = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy/MM/dd HH:mm:ss");
+  Logger.log(`makeDriverRouteTabs: finished at ${finishedTimestamp}`);
+  return finishedTimestamp;
+}
+
+/* -------------------------
+   Helper: cleanupPreviousRouteSheets
+   - deletes sheets whose name starts with prefix
+------------------------- */
+function cleanupPreviousRouteSheets(ss, prefix) {
+  const sheets = ss.getSheets();
+  sheets.forEach(sh => {
+    try {
+      if (sh.getName().startsWith(prefix)) ss.deleteSheet(sh);
+    } catch (e) {
+      // ignore delete errors for protected or active sheets
+      Logger.log(`cleanupPreviousRouteSheets: ${e}`);
+    }
+  });
+}
+
+/* -------------------------
+   Helper: loadDriverRouteData
+   - returns { dataSheet, headers, dataRows }
+------------------------- */
+function loadDriverRouteData(ss, sheetName) {
+  const dataSheet = ss.getSheetByName(sheetName);
+  if (!dataSheet) return { dataSheet: null, headers: [], dataRows: [] };
+
+  const dataRange = dataSheet.getDataRange();
+  const data = dataRange.getValues() || [];
+  if (data.length === 0) return { dataSheet, headers: [], dataRows: [] };
+
+  const headers = data[0].map(h => String(h).trim());
+  const dataRows = data.slice(1);
+  return { dataSheet, headers, dataRows };
+}
+
+/* -------------------------
+   Helper: filterDriverRouteRows
+   - keeps only rows with Conf for == YES or contains NO ANS
+   - if confForIdx === -1, returns original rows
+------------------------- */
+function filterDriverRouteRows(dataRows, confForIdx) {
+  if (confForIdx === -1) return dataRows.slice(); // no filtering column present
+
+  const filtered = dataRows.filter(row => {
+    const val = String(row[confForIdx] || "").toUpperCase().trim();
+    return val === "YES" || val.includes("NO ANS");
+  });
+  return filtered;
+}
+
+/* -------------------------
+   Helper: buildRouteDriverMap
+   - reads DeliveriesHelpTable (route -> driver)
+------------------------- */
+function buildRouteDriverMap(ss, helperSheetName) {
+  const map = {};
+  const helper = ss.getSheetByName(helperSheetName);
+  if (!helper) return map;
+  const rows = helper.getDataRange().getValues().slice(1);
+  rows.forEach(r => {
+    const key = String(r[0] || "").trim();
+    const drv = String(r[1] || "").trim();
+    if (key) map[key] = drv;
+  });
+  return map;
+}
+
+/* -------------------------
+   Helper: groupRowsByRoute
+   - groups by headerName (routeDescription)
+   - returns { route: { plainRows: [], personStops: { address|name: [rows] } } }
+------------------------- */
+function groupRowsByRoute(dataRows, headers, headerName) {
+  const map = {};
+  const routeIdx = headers.indexOf(headerName);
+  const addressIdx = headers.indexOf("Address");
+  const nameIdx = headers.indexOf("Name");
+
+  dataRows.forEach(row => {
+    const route = String(routeIdx !== -1 ? row[routeIdx] : "").trim();
+    if (!route) return;
+    if (!map[route]) map[route] = { plainRows: [], personStops: {}, firstRowKey: row.join() };
+    map[route].plainRows.push(row);
+
+    const address = String(addressIdx !== -1 ? row[addressIdx] : "").trim();
+    const name = String(nameIdx !== -1 ? row[nameIdx] : "").trim();
+    const personKey = address ? (address + "|" + name) : (name || Math.random().toString(36).slice(2,8));
+    if (!map[route].personStops[personKey]) map[route].personStops[personKey] = [];
+    map[route].personStops[personKey].push(row);
+  });
+
+  return map;
+}
+
+/* -------------------------
+   Helper: extractMapLinkForRoute
+   - Finds the first Delivery Map Links value for a route and attempts to extract:
+     { link: urlOrEmpty, label: displayLabelOrDefault }
+------------------------- */
+function extractMapLinkForRoute(opts) {
+  const { ss, dataSheet, headers, dataRows, routeValue, deliveryMapColumnHeader } = opts || {};
+  if (!dataSheet || !headers || !dataRows) return { link: "", label: "" };
+
+  const deliveryMapLinkIndex = headers.indexOf(deliveryMapColumnHeader);
+  if (deliveryMapLinkIndex === -1) return { link: "", label: "" };
+
+  // Find a row in the full data table that belongs to this route
+  const routeIdx = headers.indexOf("routeDescription");
+  if (routeIdx === -1) return { link: "", label: "" };
+
+  // Locate first matching row in the original dataRows array
+  const matchRow = dataRows.find(r => String(r[routeIdx]).trim() === routeValue);
+  if (!matchRow) return { link: "", label: "" };
+
+  // Find its 1-based position in the sheet (we need to search the sheet rows to get Range object)
+  const stringified = matchRow.join();
+  const allValues = dataSheet.getDataRange().getValues();
+  const foundIndex = allValues.findIndex(r => r.join() === stringified);
+  if (foundIndex === -1) return { link: "", label: "" };
+
+  const rowNumber = foundIndex + 1; // 1-based
+  const colNumber = deliveryMapLinkIndex + 1;
+  const range = dataSheet.getRange(rowNumber, colNumber);
+
+  // Attempt to get display label & link
+  let label = String(range.getDisplayValue() || '').trim();
+  let link = "";
+
+  const rt = range.getRichTextValue && range.getRichTextValue();
+  if (rt && rt.getLinkUrl && rt.getLinkUrl()) {
+    link = rt.getLinkUrl();
+  } else {
+    const raw = String(range.getValue() || "").trim();
+    if (raw && raw.toLowerCase().startsWith("http")) link = raw;
+  }
+
+  // Fallback label logic
+  if (!link) label = `Open Map for ${routeValue}`;
+  else if (!label || label === link) label = `Open Map for ${routeValue}`;
+
+  return { link, label };
+}
+
+/* -------------------------
+   Helper: shortenUrlForTyping
+------------------------- */
+function shortenUrlForTyping(url) {
+  if (!url) return "";
+  try {
+    return UrlFetchApp.fetch(
+      "https://is.gd/create.php?format=simple&url=" + encodeURIComponent(url)
+    ).getContentText();
+  } catch (e) {
+    return url; // fallback
+  }
+}
+
+/* -------------------------
+   Helper: writeRouteIndexSheet
+   - writes or creates an index sheet summary
+------------------------- */
+function writeRouteIndexSheet(ss, indexSheetName, summaryRows) {
+  let indexSheet = ss.getSheetByName(indexSheetName);
+  if (!indexSheet) indexSheet = ss.insertSheet(indexSheetName);
+  indexSheet.clearContents();
+  indexSheet.clearFormats();
+
+  if (!summaryRows || summaryRows.length === 0) return;
+  indexSheet.getRange(1,1,summaryRows.length, summaryRows[0].length).setValues(summaryRows);
+  indexSheet.getRange(1,1,1,summaryRows[0].length).setFontWeight("bold").setBackground("#F0F0F0").setHorizontalAlignment("center");
+  indexSheet.autoResizeColumns(1, summaryRows[0].length);
+}
+
+/* -------------------------
+   Small utilities
+------------------------- */
+function pickRouteColor(index) {
+  const routeColors = [
+    "#D9EAD3", "#FFF2CC", "#FCE5CD", "#D9D2E9", "#CFE2F3",
+    "#F4CCCC", "#EAD1DC", "#E0F7FA", "#F8BBD0", "#B2EBF2",
+    "#E8F5E9", "#FFF9C4", "#FFCCBC", "#C5CAE9", "#DCEDC8"
+  ];
+  return routeColors[index % routeColors.length];
+}
+
+function pickStopColors() {
+  return [
+    "#D9EAD3", "#FFF2CC", "#FCE5CD", "#D9D2E9", "#CFE2F3",
+    "#F4CCCC", "#EAD1DC", "#E0F7FA", "#F8BBD0", "#B2EBF2",
+    "#E8F5E9", "#FFF9C4", "#FFCCBC", "#C5CAE9", "#DCEDC8"
+  ];
+}
+
+/**********************************************************************
+ Batch 2 — ROUTE SHEET BUILDERS
+ These functions replace the route-level responsibilities of
+ populateRouteTabs (headers, map links, item summaries, timestamps)
+***********************************************************************/
+
+/**
+ * Main route sheet builder (Batch 2)
+ * Batch 3 will add: write person blocks inside this controller.
+ */
+function buildRouteSheet(opts) {
+  const {
+    ss,
+    sheet,
+    route,
+    driverName,
+    personStops,
+    itemMap,
+    finalItemHeaders,
+    headers,
+    routeColor,
+    colIndices,
+    mapInfo
+  } = opts;
+
+  sheet.clearFormats();
+
+  const rollup = computeRouteItemRollup(personStops, itemMap, headers);
+
+  // 1. Write the Header (Colors A1:J7 Gray)
+  writeFullRouteHeader({
+    sheet,
+    route,
+    driverName,
+    mapInfo,
+    rollup,
+    itemMap
+  });
+
+  // --- ADD THIS LINE BELOW ---
+  // This clears any "bleeding" gray background from row 8 down to the end of the sheet
+  sheet.getRange(8, 1, sheet.getMaxRows() - 7, 10).setBackground("white");
+  // ---------------------------
+
+  const stopColors = pickStopColors();
+  let row = 9; // row 8 intentionally blank and now forced to white
+
+  Object.values(personStops).forEach((rowsForPerson, idx) => {
+    const currentColor = stopColors[idx % stopColors.length];
+    const tableStartRow = row;
+
+    row = writeStopTable({
+      sheet,
+      rowsForPerson,
+      headers,
+      itemMap,
+      routeColor: currentColor, 
+      startRow: row
+    });
+
+    applyStopTableBorders({
+      sheet,
+      startRow: tableStartRow,
+      endRow: row - 2, 
+      stopColor: currentColor
+    });
+  });
+
+  return row;
+}
+
+/**********************************************************************
+ ROUTE SHEET Header
+***********************************************************************/
+function writeFullRouteHeader(opts) {
+  const { sheet, route, driverName, mapInfo, rollup, itemMap } = opts;
+
+  // Column widths
+  sheet.setColumnWidth(1, 250);
+  for (let c = 2; c <= 10; c++) sheet.setColumnWidth(c, 100);
+
+  // HR1 — Driver / Route
+  sheet.getRange("A1:D1").merge()
+    .setValue(driverName)
+    .setFontWeight("bold")
+    .setFontSize(24)
+    .setHorizontalAlignment("left");
+
+  sheet.getRange("E1:J1").merge()
+    .setValue(route)
+    .setFontWeight("bold")
+    .setFontSize(24)
+    .setHorizontalAlignment("right");
+
+  // HR2 — Map Link
+  sheet.getRange("A2").setValue("Map Link:")
+    .setFontSize(16);
+
+  const mapCell = sheet.getRange("B2:J2").merge()
+    .setFontSize(16)
+    .setHorizontalAlignment("right");
+
+  if (mapInfo?.link) {
+    mapCell.setRichTextValue(
+      SpreadsheetApp.newRichTextValue()
+        .setText(mapInfo.label || mapInfo.link)
+        .setLinkUrl(mapInfo.link)
+        .build()
+    );
+  } else {
+    mapCell.setValue("No map available");
+  }
+
+  // HR3 — Short Link
+  sheet.getRange("A3").setValue("Short/Typeable Link:")
+    .setFontSize(16);
+
+  const shortUrl = mapInfo?.link ? shortenUrlForTyping(mapInfo.link) : "";
+  sheet.getRange("B3:J3").merge()
+    .setValue(shortUrl)
+    .setFontSize(16)
+    .setHorizontalAlignment("right");
+
+  // --- HR4: Route Items (Headers) ---
+  sheet.getRange("A4").setValue("Route Items")
+    .setFontWeight("bold")
+    .setFontSize(12);
+
+  // We define itemNames ONCE using the labels from your itemMap
+  const itemNames = itemMap.map(i => i.label);
+
+  sheet.getRange(4, 2, 1, itemNames.length)
+    .setValues([itemNames])
+    .setFontWeight("bold")
+    .setFontSize(12)
+    .setHorizontalAlignment("center");
+
+  // --- HR5: Totals Row (Quantities) ---
+  sheet.getRange("A5").setValue("Total Quantities")
+    .setFontWeight("bold")
+    .setFontSize(14);
+
+  // Map the rollup values to the headers defined above
+  const totalValues = itemNames.map(name => rollup[name] || "");
+
+  // Write the values starting at Column B (2)
+  const totalsRange = sheet.getRange(5, 2, 1, totalValues.length);
+  totalsRange.setValues([totalValues])
+    .setFontWeight("bold")
+    .setFontSize(14)
+    .setHorizontalAlignment("center");
+
+  // Specific check: If 'diapers' is in your map, it will now land 
+  // exactly in its assigned column in Row 5.
+
+  // HR6 — Static explanation (wrapped, auto-height)
+  const hr6 = sheet.getRange("A6:J6").merge();
+
+  hr6.setValue(
+    "In this table here, diapers shows the quantity of PACKS of Diapers and/or Pull-Ups for your route, but in the tables below, it will show the sizes each delivery gets instead. Everything else is a quantity."
+  );
+
+  hr6
+    .setWrap(true)
+    .setFontStyle("italic");
+
+
+  // HR7 — Timestamp (merged, centered, bold)
+  const stamp = Utilities.formatDate(
+    new Date(),
+    Session.getScriptTimeZone(),
+    "yyyy/MM/dd HH:mm:ss"
+  );
+
+  sheet.getRange("A7:J7")
+    .merge()
+    .setValue(`Generated: ${stamp}`)
+    .setFontWeight("bold")
+    .setFontSize(16)
+    .setHorizontalAlignment("center")
+    .setVerticalAlignment("middle");
+
+
+  // Background shading HR1–HR7
+  sheet.getRange("A1:J7").setBackground("#f3f3f3");
+
+    // Medium border around entire header (HR1–HR7)
+  sheet.getRange("A1:J7").setBorder(
+    true,  // top
+    true,  // left
+    true,  // bottom
+    true,  // right
+    false, // vertical inner
+    false, // horizontal inner
+    "#000000",
+    SpreadsheetApp.BorderStyle.SOLID_MEDIUM
+  );
+
+}
+
+/**********************************************************************
+ ITEM ROLLUP LOGIC
+***********************************************************************/
+function computeRouteItemRollup(personStops, itemMap, headers) {
+  const rollup = {};
+  const allRows = Object.values(personStops).flat();
+  
+  const diaperIndices = [
+    headers.indexOf("diapers1(size)"),
+    headers.indexOf("diapers2(size)"),
+    headers.indexOf("diapers3(size)")
+  ].filter(idx => idx !== -1);
+
+  itemMap.forEach(item => {
+    const label = item.label;
+    if (!label) return;
+
+    if (item.type === "qty" && item.sourceHeader) {
+      const idx = headers.indexOf(item.sourceHeader);
+      const total = allRows.reduce((sum, row) => {
+        const v = Number(row[idx] || 0);
+        return sum + (isFinite(v) ? v : 0);
+      }, 0);
+      rollup[label] = total > 0 ? total : "";
+    }
+
+    if (item.type === "diapers") {
+      let totalPacks = 0;
+      allRows.forEach(row => {
+        diaperIndices.forEach(idx => {
+          // If the cell contains a size (like "1" or "4"), it counts as 1 pack
+          if (String(row[idx] || '').trim() !== "") {
+            totalPacks++;
+          }
+        });
+      });
+      rollup[label] = totalPacks > 0 ? totalPacks : "";
+    }
+  });
+
+  return rollup;
+}
+
+/**********************************************************************
+ UTILITIES
+***********************************************************************/
+function applyRouteColumnWidths(sheet) {
+  sheet.setColumnWidth(1, 180); // labels / people names
+  sheet.setColumnWidth(2, 300); // text / links
+  sheet.setColumnWidth(3, 90);
+  sheet.setColumnWidth(4, 90);
+  sheet.setColumnWidth(5, 90);
+}
+
+/*
+function shortenUrl(url) {
+  if (!url || url.length <= 60) return url;
+  return url.substring(0, 55) + "...";
+}
+*/
+
+/**BATCH 3 Alt:
+ * *****/
+
+function writeStopTable(opts) {
+  const {
+    sheet,
+    rowsForPerson,
+    headers,
+    itemMap,
+    routeColor,
+    startRow
+  } = opts;
+
+  let row = startRow;
+
+  row = writeSTR1(sheet, rowsForPerson, headers, row);
+  //row = writeSTR2(sheet, rowsForPerson, headers, row);
+  row = renderSpecialItemRequestsRow({ sheet, rowsForPerson, headers, row });
+  //row = writeSTR3(sheet, rowsForPerson, headers, row);
+  row = renderSpecialDeliveryInstructionsRow({ sheet, rowsForPerson, headers, row });
+  row = writeSTR4(sheet, rowsForPerson, headers, itemMap, row);
+  row = writeSTR5(sheet, rowsForPerson, headers, itemMap, row);
+
+  const endRow = row - 1; // last written row
+
+  // Border around entire stop table (A:J)
+  sheet.getRange(startRow, 1, endRow - startRow + 1, 10).setBorder(
+    true, true, true, true,   // outer borders
+    false, false,             // no internal lines
+    "black",
+    SpreadsheetApp.BorderStyle.SOLID_MEDIUM
+  );
+
+  return row + 1; // single blank row after table
+}
+
+
+function writeSTR1(sheet, rows, headers, row) {
+  const nameIdx = headers.indexOf("Name");
+  const phoneIdx = headers.indexOf("Phone");
+  const addrIdx = headers.indexOf("Address");
+
+  const r = rows[0];
+  const leftText = `${r[nameIdx] || ""}  /  ${r[phoneIdx] || ""}`;
+  const rightText = r[addrIdx] || "";
+
+  sheet.getRange(`A${row}:D${row}`).merge()
+    .setValue(leftText)
+    .setFontWeight("bold")
+    .setFontSize(16)
+    .setHorizontalAlignment("left");
+
+  sheet.getRange(`E${row}:J${row}`).merge()
+    .setValue(rightText)
+    .setFontWeight("bold")
+    .setFontSize(16)
+    .setHorizontalAlignment("right");
+
+  return row + 1;
+}
+
+function writeSTR2(sheet, rows, headers, row) {
+  const idx = headers.indexOf("Special Item Requests");
+  if (idx === -1) return row;
+
+  const text = rows.map(r => r[idx]).filter(Boolean).join("\n");
+  if (!text) return row;
+
+  sheet.getRange(`A${row}`).setValue("Special Item Requests:")
+    .setFontSize(12);
+
+  sheet.getRange(`B${row}:J${row}`).merge()
+    .setValue(text)
+    .setFontSize(16)
+    .setWrap(true);
+
+  return row + 1;
+}
+
+function writeSTR3(sheet, rows, headers, row) {
+  const idx = headers.indexOf("Special Delivery Instructions");
+  if (idx === -1) return row;
+
+  const text = rows.map(r => r[idx]).filter(Boolean).join("\n");
+  if (!text) return row;
+
+  sheet.getRange(`A${row}`).setValue("Special Instructions:")
+    .setFontSize(12);
+
+  sheet.getRange(`B${row}:J${row}`).merge()
+    .setValue(text)
+    .setFontSize(16)
+    .setWrap(true);
+
+  return row + 1;
+}
+
+function writeSTR4(sheet, rows, headers, itemMap, row) {
+  sheet.getRange(`A${row}`).setValue("Special Item Types:")
+    .setFontSize(12);
+
+  const labels = itemMap.map(i => i.label);
+  sheet.getRange(row, 2, 1, labels.length)
+    .setValues([labels])
+    .setFontSize(10)
+    .setHorizontalAlignment("center");
+
+  return row + 1;
+}
+
+function writeSTR5(sheet, rows, headers, itemMap, row) {
+  sheet.getRange(`A${row}`).setValue("Special Item Values:")
+    .setFontSize(12);
+
+  // Diaper sorting order for the consolidated list
+  const diaperOrder = ['P','N','1','2','3','4','5','6','7','8','2/3T','3/4T','4/5T','5/6T','6/7T'];
+
+  const values = itemMap.map(item => {
+    // 1. Handle standard quantity items (Food, Eggs, etc.)
+    if (item.type === "qty") {
+      const idx = headers.indexOf(item.sourceHeader);
+      const total = rows.reduce((s, r) => s + Number(r[idx] || 0), 0);
+      return total > 0 ? total : "";
+    }
+
+    // 2. Handle Diapers (Consolidating sizes into a string like "1 | 3")
+    if (item.type === "diapers") {
+      const sizes = new Set();
+      
+      // Look through every row for this person and every diaper column index
+      rows.forEach(r => {
+        item.sourceIndex.forEach(i => {
+          if (i !== -1) {
+            const val = String(r[i] || '').trim();
+            if (val) sizes.add(val);
+          }
+        });
+      });
+
+      if (sizes.size === 0) return "";
+
+      // Sort based on the diaperOrder array and join with a pipe
+      return Array.from(sizes)
+        .sort((a, b) => diaperOrder.indexOf(a) - diaperOrder.indexOf(b))
+        .join(' | ');
+    }
+    
+    return "";
+  });
+
+  sheet.getRange(row, 2, 1, values.length)
+    .setValues([values])
+    .setFontWeight("bold")
+    .setFontSize(14)
+    .setHorizontalAlignment("center");
+
+  return row + 1;
+}
+
+/**********************************************************************
+ SECTION 2 — Special Item Requests (Modular)
+ ***********************************************************************/
+function renderSpecialItemRequestsRow(opts) {
+  const { sheet, rowsForPerson, headers, row } = opts;
+  const idx = headers.indexOf("Special Item Requests");
+  if (idx === -1) return row;
+
+  const all = rowsForPerson.map(r => r[idx]).filter(v => v);
+  if (all.length === 0) return row;
+
+  const text = all.join("\n");
+  const keywords = ["gluten", "dairy", "vegan", "vegetarian", "allergy", "nut", "tomato", "tomatos", "tomatoes", "soy", "lactose", "plant", "extra", "no", "non", "not"];
+
+  // 1. Prepare the cell structure
+  sheet.getRange(row, 1).setValue("Special Item Requests:").setFontSize(12);
+  const target = sheet.getRange(row, 2, 1, 9);
+  target.merge().setWrap(true);
+
+  // 2. Generate the RichText using your function
+  // Passing text and keywords as two separate arguments to match your definition
+  const rich = createPartiallyBoldedText(text, keywords);
+
+  // 3. Apply the RichText to the top-left cell of the merged range
+  //sheet.getRange(row, 2).setRichTextValue(rich);
+  // 3. Apply the RichText to the top-left cell of the merged range
+  const cell = sheet.getRange(row, 2);
+  cell.setRichTextValue(rich);
+  cell.setFontSize(16); // Force the container to 16
+  
+  return row + 1;
+}
+
+/**********************************************************************
+ SECTION 3 — Special Delivery Instructions (Modular)
+ ***********************************************************************/
+function renderSpecialDeliveryInstructionsRow(opts) {
+  const { sheet, rowsForPerson, headers, row } = opts;
+  const idx = headers.indexOf("Special Delivery Instructions");
+  if (idx === -1) return row;
+
+  const all = rowsForPerson.map(r => r[idx]).filter(v => v);
+  if (all.length === 0) return row;
+
+  const text = all.join("\n");
+  // Optional: Add delivery-specific keywords if you want bolding here too
+  const deliveryKeywords = ["gate", "code", "door", "ring", "back", "side", "call"];
+
+  sheet.getRange(row, 1).setValue("Special Instructions:").setFontSize(12);
+  const target = sheet.getRange(row, 2, 1, 9);
+  target.merge().setWrap(true);
+
+  const rich = createPartiallyBoldedText(text, deliveryKeywords);
+  const cell = sheet.getRange(row, 2);
+  cell.setRichTextValue(rich);
+  cell.setFontSize(16); // Force the container to 16
+
+  return row + 1;
+}
+/**********************************************************************
+ STOP TABLE FORMATTING — Borders, shading
+***********************************************************************/
+function applyStopTableBorders(opts) {
+  const { sheet, startRow, endRow, stopColor } = opts;
+  const totalCols = 10; // A:J
+
+  const rng = sheet.getRange(startRow, 1, endRow - startRow + 1, totalCols);
+
+  // 1. Fill the entire stop with its assigned color
+  rng.setBackground(stopColor);
+
+  // 2. Apply a solid medium outer border
+  rng.setBorder(
+    true, true, true, true,   // Top, Left, Bottom, Right
+    false, false,             // No internal lines
+    "black", 
+    SpreadsheetApp.BorderStyle.SOLID_MEDIUM
+  );
+  
+  // 3. Optional: Add a subtle dotted line between the Name row and the Items row
+  // This helps scanability if the tables are long.
+  sheet.getRange(startRow, 1, 1, totalCols).setBorder(
+    null, null, true, null, 
+    false, false, 
+    "black", 
+    SpreadsheetApp.BorderStyle.DOTTED
+  );
+}
+
+
+/**********************************************************************
+ ITEM EXTRACTION HELPERS
+***********************************************************************/
+function extractItemValuesForPerson(rows, itemMap, headers) {
+  const out = {};
+
+  itemMap.forEach(item => {
+    const label = item.label;
+
+    if (item.type === "qty" && item.sourceHeader) {
+      const idx = headers.indexOf(item.sourceHeader);
+      out[label] = rows.reduce((sum, r) => sum + Number(r[idx] || 0), 0);
+    }
+
+    if (item.type === "diapers") {
+      out["diapers"] = 0;
+      const indices = item.sourceIndex || [];
+      indices.forEach(idx => {
+        out["diapers"] += rows.reduce((sum, r) => sum + Number(r[idx] || 0), 0);
+      });
+    }
+  });
+
+  return out;
+}
+
+
+
+// End New drivers tab functions
+
+
+
+// New packing list tab functions
+
+function makePackingLists() {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
+    refreshDeliveriesHelpTable();
     const dataSheet = ss.getSheetByName("Deliveries-UPDATE HERE");
-    const outputSheetName = "SpecialItemsCoordinator";
+    const helperSheet = ss.getSheetByName("DeliveriesHelpTable");
+    const outputSheet = setupPackingListTab(ss, "PackingLists");
+
+    // 1. Load and Prepare Data
+    const { 
+        dataRows, 
+        headers, 
+        confForIdx, 
+        includedIndexes, 
+        diaperSizeIndices, 
+        packsOrigIdx, 
+        eggsOrigIdx, 
+        milkOrigIdx, 
+        wipesOrigIdx, 
+        dogFoodOrigIdx, 
+        catFoodOrigIdx, 
+        toiletriesOrigIdx, 
+        femHygieneOrigIdx,
+        routeIdx,
+        driverIdx
+    } = loadAndIndexPackingData(dataSheet);
+
+    const routeDriverMap = buildPackingListRouteDriverMap(helperSheet);
+    
+    // 2. Filter Data for Calculations and Route Tables
+    const { confirmedDataRows, dataRowsForDiaperCount } = filterPackingDataForReports(dataRows, confForIdx);
+    
+    // 3. Perform Calculations
+    const allDiaperItems = defineDiaperItems();
+    const diaperCounts = calculatePackingDiaperAndWipesCounts(dataRowsForDiaperCount, allDiaperItems, diaperSizeIndices, wipesOrigIdx);
+    const confForCounts = calculatePackingConfirmationCounts(dataRows, confForIdx);
+    
+    // 4. Generate Tables
+    let outputRow = 1;
+    
+    // A. Item Summary (A1)
+    outputRow = generateItemSummaryTable(outputSheet, confirmedDataRows, packsOrigIdx, eggsOrigIdx, milkOrigIdx, outputRow);
+    
+    // B. Confirmation Status (H1) - This table starts at the same row as Item Summary
+    // It does NOT update outputRow as it's side-by-side.
+    generateConfirmationStatusTable(outputSheet, confForCounts, 1); // Start Row 1 is still correct here
+
+    // C. Diaper/Wipes Reference (Starts after Item Summary)
+    // We add a 2-row buffer below the first two tables, which both end at Row 4/5.
+    // The Diaper table should start at Row 7 (5 + 2).
+    outputRow = generateDiaperReferenceTable(outputSheet, allDiaperItems, diaperCounts, outputRow + 2); 
+    
+    // D. Timestamp and Route Sections
+    // Add a 2-row buffer before the timestamp
+    outputRow = generateTimestamp(outputSheet, outputRow + 2); 
+
+    generatePackingListRouteSections(
+        outputSheet, dataRowsForDiaperCount, headers, routeDriverMap, diaperCounts,
+        {
+            routeIdx, driverIdx, confForIdx, includedIndexes,
+            packsOrigIdx, eggsOrigIdx, milkOrigIdx, dogFoodOrigIdx, catFoodOrigIdx,
+            wipesOrigIdx, toiletriesOrigIdx, femHygieneOrigIdx
+        },
+        // This clears all existing "baked-in" green formatting before writing new data
+        outputRow
+    );
+
+    // 5. Final Formatting
+    applyPackingListFinalColumnSizing(outputSheet, includedIndexes, driverIdx, headers);
+    
+    SpreadsheetApp.flush();
+    return outputSheet.getName();
+}
+
+function setupPackingListTab(ss, outputSheetName) {
     let outputSheet = ss.getSheetByName(outputSheetName);
     if (!outputSheet) outputSheet = ss.insertSheet(outputSheetName);
 
-    // Completely clear previous content, formatting, filters
-    outputSheet.clearContents();
-    outputSheet.clearFormats();
+    // Get the maximum size of the sheet to ensure full clearing
+    const maxRows = outputSheet.getMaxRows();
+    const maxCols = outputSheet.getMaxColumns();
+
+    // Get the range covering the entire sheet
+    const fullRange = outputSheet.getRange(1, 1, maxRows, maxCols);
+
+    // Completely clear previous content, formatting, filters, and validations
+    // Note: If you use outputSheet.clear(), you don't need all the clears below,
+    // but using the Range object is safer if the sheet might be large.
+    
+    // Using Range methods is more specific and often faster than relying on Sheet.clear()
+    // fullRange.clearContents();
+    // fullRange.clearFormats();
+    // fullRange.clearDataValidations();
+    fullRange.clear();
+
+    // Clear filters (if any)
+    if (outputSheet.getFilter()) {
+        outputSheet.getFilter().remove();
+    }
+    
+    // Clear frozen rows/columns (already in your original code, kept for completeness)
     outputSheet.setFrozenRows(0);
     outputSheet.setFrozenColumns(0);
-    if (outputSheet.getFilter()) outputSheet.getFilter().remove(); // remove filter
-
-    const data = dataSheet.getDataRange().getValues();
-    const headers = data[0];
-    const dataRows = data.slice(1);
     
-    // --- KEYWORD DEFINITION FOR CONDITIONAL BOLDING ---
-    const keywords = ["gluten", "dairy", "vegan", "vegetarian", "allergy"];
-    // --------------------------------------------------
+    return outputSheet;
+}
 
-    // --- DIAPER SIZE DATA DEFINITION (START) ---
+function defineDiaperItems() {
     const rawDiaperSizes = [
-        // CODE | DESCRIPTION | RANGE
-        ["N", "Newborn Diapers", "< 10 lbs"],
-        ["1", "Size 1 Diapers", "8-14 lbs"],
-        ["2", "Size 2 Diapers", "12-18 lbs"],
-        ["3", "Size 3 Diapers", "16-28 lbs"],
-        ["4", "Size 4 Diapers", "22-37 lbs"],
-        ["5", "Size 5 Diapers", "27 + lbs"],
-        ["6", "Size 6 Diapers", "35 + lbs"],
-        ["7", "Size 7 Diapers", "41 + lbs"],
-        ["2/3T", "Size 2T/3T PullUps", "16-34 lbs"],
-        ["3/4T", "Size 3T/4T PullUps", "30-40 lbs"],
-        ["4/5T", "Size 4T/5T PullUps", "37 + lbs"],
-        ["5/6T", "Size 5T/6T PullUps", "41 + lbs"],
-        ["6/7T", "Size 6T/7T PullUps", "64 + lbs"],
-        ["MASMD", "Masc Adult Sm/Med Diapers", "28-40 inch waist"],
-        ["MALXD", "Masc Adult Large/XL Diapers", "38-64 inch waist"],
-        ["FASMD", "Fem Adult Sm/Med Diapers", "28-40 inch waist"],
-        ["FALD", "Fem Adult Large Diapers", "38-50 inch waist"],
-        ["FAXD", "Fem Adult XL Diapers", "48-64 inch waist"],
-        ["FAXXD", "Fem Adult XXL Diapers", "64-80 inch waist"]
+        ["N", "Newborn Diapers", "< 10 lbs"], ["1", "Size 1 Diapers", "8-14 lbs"],
+        ["2", "Size 2 Diapers", "12-18 lbs"], ["3", "Size 3 Diapers", "16-28 lbs"],
+        ["4", "Size 4 Diapers", "22-37 lbs"], ["5", "Size 5 Diapers", "27 + lbs"],
+        ["6", "Size 6 Diapers", "35 + lbs"], ["7", "Size 7 Diapers", "41 + lbs"],
+        ["2/3T", "Size 2T/3T PullUps", "16-34 lbs"], ["3/4T", "Size 3T/4T PullUps", "30-40 lbs"],
+        ["4/5T", "Size 4T/5T PullUps", "37 + lbs"], ["5/6T", "Size 5T/6T PullUps", "41 + lbs"],
+        ["6/7T", "Size 6T/7T PullUps", "64 + lbs"], ["AdSml", "Adult Small Diapers", ""],
+        ["AdMed", "Adult Medium Diapers", ""], ["AdLrg", "Adult Large Diapers", ""],
+        ["AdXL", "Adult Xtra Large Diapers", ""], ["AdXXL", "Adult XXL Diapers", ""]
     ];
     
-    // This array will hold the final list for the table rows (18 data + 1 total + 1 wipes = 20 rows)
     const allDiaperItems = [...rawDiaperSizes]; 
-    
-    // Add Total Diaper Packs row (Req 4)
     allDiaperItems.push(["Diapers Total", "Total Diaper Packs", ""]); 
-    
-    // Add Wipes row
     allDiaperItems.push(["Wipes", "Wipes Packs", ""]); 
-    // --- DIAPER SIZE DATA DEFINITION (END) ---
-
-    // Identify key indexes
-    const routeIdx = headers.indexOf("routeDescription");
-    const driverIdx = headers.indexOf("Driver");
     
-    // Locate the "Conf for" column
-    const confForHeader = headers.find(h => typeof h === 'string' && h.trim().startsWith("Conf for"));
-    const confForIdx = confForHeader ? headers.indexOf(confForHeader) : -1;
+    return allDiaperItems;
+}
 
-    // Columns for coordinator view
+function loadAndIndexPackingData(dataSheet) {
+    const data = dataSheet.getDataRange().getValues();
+    const headers = data[0].map(h => String(h).trim()); // Ensure headers are strings and trimmed
+    const dataRows = data.slice(1);
+    
     const includedCols = [
         "Driver", "Name", "# packs", "# eggs", "# milk", 
         "dogFood(qty)", "catFood(qty)", "diapers1(size)", 
         "diapers2(size)", "diapers3(size)", "wipes(qty)", 
         "toiletries(qty)", "fem hygiene(qty)", "Special Item Requests"
     ];
-    const includedIndexes = includedCols.map(c => headers.indexOf(c)).filter(i => i !== -1);
 
-    // Original data sheet indices needed for totaling/counting
-    const packsOrigIdx = headers.indexOf("# packs");
-    const eggsOrigIdx = headers.indexOf("# eggs");
-    const milkOrigIdx = headers.indexOf("# milk");
-    const wipesOrigIdx = headers.indexOf("wipes(qty)"); // Wipes index
-    const diapers1Idx = headers.indexOf("diapers1(size)"); // Diaper indices
-    const diapers2Idx = headers.indexOf("diapers2(size)");
-    const diapers3Idx = headers.indexOf("diapers3(size)");
-    const diaperSizeIndices = [diapers1Idx, diapers2Idx, diapers3Idx].filter(i => i !== -1);
-    const dogFoodOrigIdx = headers.indexOf("dogFood(qty)");
-    const catFoodOrigIdx = headers.indexOf("catFood(qty)");
-    const toiletriesOrigIdx = headers.indexOf("toiletries(qty)");
-    const femHygieneOrigIdx = headers.indexOf("fem hygiene(qty)");
+    const getIndex = (h) => headers.indexOf(h);
+    
+    const confForHeader = headers.find(h => h.startsWith("Conf for"));
+    const confForIdx = confForHeader ? headers.indexOf(confForHeader) : -1;
+    
+    const routeIdx = getIndex("routeDescription");
+    const driverIdx = getIndex("Driver");
+    const diapers1Idx = getIndex("diapers1(size)");
+    const diapers2Idx = getIndex("diapers2(size)");
+    const diapers3Idx = getIndex("diapers3(size)");
 
+    return {
+        dataRows,
+        headers,
+        confForIdx,
+        routeIdx,
+        driverIdx,
+        includedIndexes: includedCols.map(getIndex).filter(i => i !== -1),
+        diaperSizeIndices: [diapers1Idx, diapers2Idx, diapers3Idx].filter(i => i !== -1),
+        packsOrigIdx: getIndex("# packs"),
+        eggsOrigIdx: getIndex("# eggs"),
+        milkOrigIdx: getIndex("# milk"),
+        wipesOrigIdx: getIndex("wipes(qty)"),
+        dogFoodOrigIdx: getIndex("dogFood(qty)"),
+        catFoodOrigIdx: getIndex("catFood(qty)"),
+        toiletriesOrigIdx: getIndex("toiletries(qty)"),
+        femHygieneOrigIdx: getIndex("fem hygiene(qty)")
+    };
+}
 
-    // Build route-driver mapping 
-    const helperSheet = ss.getSheetByName("DeliveriesHelpTable");
+function buildPackingListRouteDriverMap(helperSheet) {
     const routeDriverMap = {};
     if (helperSheet) {
         const helperData = helperSheet.getDataRange().getValues().slice(1);
@@ -97,237 +1110,205 @@ function generateSpecialItemsCoordinator() {
             if (routeKey) routeDriverMap[routeKey] = driverValue; 
         });
     }
+    return routeDriverMap;
+}
 
-    // --- Filter data to include only confirmed deliveries ('YES') for Item Summary ---
+function filterPackingDataForReports(dataRows, confForIdx) {
     let confirmedDataRows = dataRows;
+    let dataRowsForDiaperCount = dataRows;
+
     if (confForIdx !== -1) {
+        // Confirmed only (for Item Summary Totals)
         confirmedDataRows = dataRows.filter(row => {
             const confValue = String(row[confForIdx] || '').toUpperCase().trim();
             return confValue === 'YES';
         });
-    }
 
-    // --- Filter data for Diaper/Wipes Count (YES or NO ANS) and Route Tables ---
-    let dataRowsForDiaperCount = dataRows;
-    if (confForIdx !== -1) {
+        // Diaper/Wipes Count and Route Tables (YES or NO ANS)
         dataRowsForDiaperCount = dataRows.filter(r => {
             const confValue = String(r[confForIdx] || '').toUpperCase().trim();
-            // Filter is YES or includes NO ANS
             return confValue === 'YES' || confValue.includes('NO ANS');
         });
     }
-    // ------------------------------------------------------------------------------------------
+    return { confirmedDataRows, dataRowsForDiaperCount };
+}
+
+function calculatePackingDiaperAndWipesCounts(dataRowsForDiaperCount, allDiaperItems, diaperSizeIndices, wipesOrigIdx) {
+    // Create a temporary map where all keys are UPPERCASE for matching
+    const diaperCounts = allDiaperItems.reduce((acc, item) => { 
+      acc[item[0].toUpperCase()] = 0; 
+      return acc; 
+    }, {});
     
-    // --- CALCULATE DIAPER AND WIPES COUNTS ---
-    const diaperCounts = allDiaperItems.reduce((acc, item) => { acc[item[0]] = 0; return acc; }, {});
     let totalDiaperPacks = 0; 
 
     dataRowsForDiaperCount.forEach(row => {
         // Count Diaper Codes
         diaperSizeIndices.forEach(idx => {
-            const code = String(row[idx] || '').trim().toUpperCase();
-            if (diaperCounts.hasOwnProperty(code) && code !== "Wipes" && code !== "DIAPER_TOTAL") {
-                diaperCounts[code]++;
-                totalDiaperPacks++; // Accumulate total diaper packs
+            const rawCode = String(row[idx] || '').trim().toUpperCase();
+            
+            // Match against the uppercase keys
+            if (diaperCounts.hasOwnProperty(rawCode) && rawCode !== "WIPES" && rawCode !== "DIAPERS TOTAL") {
+                diaperCounts[rawCode]++;
+                totalDiaperPacks++;
             }
         });
 
-        // Count Wipes (quantity)
+        // Count Wipes (quantity) - Note the uppercase key here
         const wipesQty = parseFloat(row[wipesOrigIdx] || 0) || 0;
-        diaperCounts["Wipes"] += wipesQty;
+        diaperCounts["WIPES"] += wipesQty;
     });
     
-    // Set the total diaper pack count
-    diaperCounts["DIAPER_TOTAL"] = totalDiaperPacks;
-    // ------------------------------------------
+    // Map the uppercase counts back to the original casing for the table display
+    const finalCounts = {};
+    allDiaperItems.forEach(item => {
+      const originalCode = item[0];
+      finalCounts[originalCode] = diaperCounts[originalCode.toUpperCase()] || 0;
+    });
 
-    // ====================================================================
-    // === Item Summary Table (A1:E4) - Item in A, Total in B:E merged ===
-    // ====================================================================
-    const summaryStartRow = 1; 
-    const summaryStartCol = 1; // Column A
-    const summaryNumCols = 5; // A, B, C, D, E
+    finalCounts["DIAPER_TOTAL"] = totalDiaperPacks;
+    return finalCounts;
+}
 
-    const totalPacks = confirmedDataRows.reduce((s, r) => s + (parseFloat(r[packsOrigIdx] || 0) || 0), 0);
-    const totalEggs = confirmedDataRows.reduce((s, r) => s + (parseFloat(r[eggsOrigIdx] || 0) || 0), 0);
-    const totalMilk = confirmedDataRows.reduce((s, r) => s + (parseFloat(String(r[milkOrigIdx]).replace('*', '') || 0)) || 0, 0);
+function calculatePackingConfirmationCounts(dataRows, confForIdx) {
+    const counts = { "NO ANS": 0, "NO": 0, "YES": 0, "Total": 0 };
+    if (confForIdx !== -1) {
+        dataRows.forEach(row => {
+            let val = String(row[confForIdx] || '').toUpperCase().trim();
+            if (val.includes("NO ANS")) {
+                counts["NO ANS"]++;
+            } else if (val === "NO") {
+                counts["NO"]++;
+            } else if (val === "YES") {
+                counts["YES"]++;
+            }
+            if (val) {
+                counts["Total"]++;
+            }
+        });
+    }
+    return counts;
+}
 
-    // 1. Set Header Row values (A1:E1)
-    // A1: "Item", B1: "Total (Confirmed Only)", C1-E1: ""
-    outputSheet.getRange(summaryStartRow, summaryStartCol, 1, summaryNumCols).setValues([
-        ["Item", "Total (Confirmed Only)", "", "", ""]
-    ]); 
+function generateItemSummaryTable(outputSheet, confirmedDataRows, packsIdx, eggsIdx, milkIdx, startRow) {
+    const summaryStartCol = 1; 
+    const summaryNumCols = 5; 
     
-    // 2. Apply Header Merge: B1:E1
-    outputSheet.getRange("B1:E1").merge();
+    const totalPacks = confirmedDataRows.reduce((s, r) => s + (parseFloat(r[packsIdx] || 0) || 0), 0);
+    const totalEggs = confirmedDataRows.reduce((s, r) => s + (parseFloat(r[eggsIdx] || 0) || 0), 0);
+    const totalMilk = confirmedDataRows.reduce((s, r) => s + (parseFloat(String(r[milkIdx]).replace('*', '') || 0)) || 0, 0);
 
-    // 3. Set Data Rows (A2:E4) - Item in A, Total in B
-    outputSheet.getRange(summaryStartRow + 1, summaryStartCol, 3, summaryNumCols).setValues([ 
+    // Set Header and Data
+    outputSheet.getRange(startRow, summaryStartCol, 1, summaryNumCols).setValues([["Standard Items", "Total (Confirmed Only)", "", "", ""]]); 
+    outputSheet.getRange(startRow + 1, summaryStartCol, 3, summaryNumCols).setValues([ 
         ["# packs", totalPacks, "", "", ""],
         ["# eggs", totalEggs, "", "", ""],
         ["# milk", totalMilk, "", "", ""]
     ]);
     
-    // 4. Apply Data Merges: B2:E2, B3:E3, B4:E4
-    for (let r = summaryStartRow + 1; r <= summaryStartRow + 3; r++) {
+    // Apply Merges
+    outputSheet.getRange("B1:E1").merge();
+    for (let r = startRow + 1; r <= startRow + 3; r++) {
         outputSheet.getRange(r, 2, 1, 4).merge(); // B:E merge
     }
 
-    // 5. Apply Formatting 
-    outputSheet.getRange(summaryStartRow, summaryStartCol, 4, summaryNumCols) 
+    // Apply Formatting
+    outputSheet.getRange(startRow, summaryStartCol, 4, summaryNumCols) 
         .setFontWeight("bold")
         .setFontSize("14")
         .setBackground("#D9EAD3")
         .setBorder(true, true, true, true, null, null);
     
-    // Alignments (left for Item, right for Total)
+    // Alignments
     outputSheet.getRange("A1").setHorizontalAlignment("left"); 
     outputSheet.getRange("B1").setHorizontalAlignment("right"); 
     outputSheet.getRange("A2:A4").setHorizontalAlignment("left"); 
-    outputSheet.getRange("B2:B4").setHorizontalAlignment("right"); 
+    outputSheet.getRange("B2:B4").setHorizontalAlignment("right");
+    return startRow + 4; // Return the next available row (Row 5)
+}
 
-    // ====================================================================
-    // === Confirmation Status Table (H1:M5) - H:K merge, L:M merge ===
-    // ====================================================================
-    const confSummaryStartRow = 1; 
+function generateConfirmationStatusTable(outputSheet, confForCounts, startRow) {
     const confSummaryStartCol = 8; // Column H
     const confSummaryNumCols = 6; // H, I, J, K, L, M
 
-    let confForCounts = { "NO ANS": 0, "NO": 0, "YES": 0, "Total": 0 };
-    if (confForIdx !== -1) {
-        dataRows.forEach(row => {
-            let val = String(row[confForIdx] || '').toUpperCase().trim();
-            if (val.includes("NO ANS")) {
-                confForCounts["NO ANS"]++;
-            } else if (val === "NO") {
-                confForCounts["NO"]++;
-            } else if (val === "YES") {
-                confForCounts["YES"]++;
-            }
-            if (val) {
-                confForCounts["Total"]++;
-            }
-        });
-    }
-
-    // 1. Set Header Row values (H1:M1)
-    // H1: "Confirmation Status", K1: "", L1: "Total Count", M1: ""
-    outputSheet.getRange(confSummaryStartRow, confSummaryStartCol, 1, confSummaryNumCols).setValues([
+    // Set Header and Data
+    outputSheet.getRange(startRow, confSummaryStartCol, 1, confSummaryNumCols).setValues([
         ["Confirmation Status", "", "", "", "Total Count", ""]
     ]);
-    
-    // 2. Apply Header Merges: H1:K1 and L1:M1
-    outputSheet.getRange("H1:K1").merge();
-    outputSheet.getRange("L1:M1").merge();
-    
-    // 3. Set Data Rows (H2:M5) - Status in H, Count in L
-    outputSheet.getRange(confSummaryStartRow + 1, confSummaryStartCol, 4, confSummaryNumCols).setValues([
+    outputSheet.getRange(startRow + 1, confSummaryStartCol, 4, confSummaryNumCols).setValues([
         ["No Ans", "", "", "", confForCounts["NO ANS"], ""],
         ["No", "", "", "", confForCounts["NO"], ""],
         ["Yes", "", "", "", confForCounts["YES"], ""],
         ["Total", "", "", "", confForCounts["Total"], ""]
     ]);
 
-    // 4. Apply Data Merges: H2:K2, L2:M2, etc.
-    for (let r = confSummaryStartRow + 1; r <= confSummaryStartRow + 4; r++) {
+    // Apply Merges
+    outputSheet.getRange("H1:K1").merge();
+    outputSheet.getRange("L1:M1").merge();
+    for (let r = startRow + 1; r <= startRow + 4; r++) {
         outputSheet.getRange(r, 8, 1, 4).merge(); // H:K merge
         outputSheet.getRange(r, 12, 1, 2).merge(); // L:M merge
     }
     
-    // 5. Apply Formatting
-    outputSheet.getRange(confSummaryStartRow, confSummaryStartCol, 5, confSummaryNumCols)
+    // Apply Formatting
+    outputSheet.getRange(startRow, confSummaryStartCol, 5, confSummaryNumCols)
         .setFontWeight("bold")
         .setFontSize("14")
-        .setBackground("#D9D2E9") // Light Purple for distinction
+        .setBackground("#D9D2E9") 
         .setBorder(true, true, true, true, null, null);
-        
-    // Alignments (left for Status, right for Total)
+
+    // Alignments
     outputSheet.getRange("H1").setHorizontalAlignment("left"); 
     outputSheet.getRange("L1").setHorizontalAlignment("right");
     outputSheet.getRange("H2:H5").setHorizontalAlignment("left");
-    outputSheet.getRange("L2:L5").setHorizontalAlignment("right");
+    outputSheet.getRange("L2:L5").setHorizontalAlignment("right");    
+    return startRow + 5; // Return the next available row (Row 6)
+}
 
-    // ====================================================================
-    // === DIAPER SIZE REFERENCE TABLE (A7:Oxx) - SWAPPED COLUMNS A and F === 
-    // ====================================================================
+function generateDiaperReferenceTable(outputSheet, allDiaperItems, diaperCounts, startRow) {
+    const diaperTableStartCol = 1; 
+    const diaperTableNumCols = 15;
+    const DIAPER_NUM_ROWS = allDiaperItems.length + 1; // Header + 21 items = 22 rows
     
-    // 1 header + 20 data rows = 21 rows
-    const DIAPER_NUM_ROWS = allDiaperItems.length + 1; 
-    const diaperTableStartRow = 7; 
-    const diaperTableStartCol = 1; // Column A
-    const diaperTableNumCols = 15; // A through O 
+    // Define the list of *only* raw sizes (excluding the last two: Total and Wipes)
+    // This is used for calculating the correct row indices for shading/borders.
+    const rawDiaperSizes = allDiaperItems.slice(0, allDiaperItems.length - 2); 
+
+    // --- 1. Set Values ---
     
     const diaperDataForSetValues = [
-        // Header Row (15 elements: A | B-E | F-G | H-I | J-M | N-O)
-        [
-            "Size/Weight Ranges",  // A (Swapped from F)
-            "Size Description",  // B
-            "",      // C
-            "",      // D
-            "",      // E
-            "Code",        // F (Swapped from A)
-            "",      // G
-            "Pre Ordered", // H
-            "",      // I
-            "Not Ordered Tally", // J
-            "",    // K
-            "",    // L
-            "",    // M
-            "Not Fulfilled Tally", // N
-            ""] // O
-    ]; 
+        ["Size/Weight Ranges", "Size Description", "", "", "", "Code", "", "Pre Ordered", "", "Not Ordered Tally", "", "", "", "Not Fulfilled Tally", ""], // Header
+        ...allDiaperItems.map(row => {
+            // Count logic depends on the specific row
+            const code = row[0];
+            const count = (code === "Diapers Total") 
+                          ? diaperCounts["DIAPER_TOTAL"] || 0
+                          : diaperCounts[code] || 0;
+                          
+            return [row[2], row[1], "", "", "", code, "", count, "", "", "", "", "", "", ""];
+        })
+    ];
 
-    // Build the data array for setValues, inserting the calculated count
-    allDiaperItems.forEach(row => {
-        const code = row[0]; // Original Code
-        const description = row[1]; // Original Description
-        const range = row[2]; // Original Range
-
-        let count = (code === "Diapers Total") ? diaperCounts["DIAPER_TOTAL"] : diaperCounts[code] || 0;
-
-        // [A:Range, B:Desc, C, D, E, F:Code, G, H:Count, I, J:NotOrdered, K, L, M, N:Unfulfilled, O]
-        diaperDataForSetValues.push([
-            range, // A: Size/Weight Ranges (Swapped)
-            description, // B: Size Description 
-            "", "", "", // C, D, E: Blanks for B-E merge
-            code, // F: Code (Swapped)
-            "", // G: Blank for F-G merge
-            count, // H: # of Pre Ordered (The calculated count)
-            "", // I: Blank for H-I merge
-            "", // J: # of Not Ordered (Blank for J-M merge)
-            "", // K: Blank for J-M merge
-            "", // L: Blank for J-M merge
-            "", // M: Blank for J-M merge
-            "", // N: Not Fulfilled Tally
-            "" // O: Blank for the N-O merge
-        ]);
-    });
-
-
-    // 1. Set the values for the whole range (A7:Oxx)
-    const diaperTableRange = outputSheet.getRange(diaperTableStartRow, diaperTableStartCol, DIAPER_NUM_ROWS, diaperTableNumCols);
+    const diaperTableRange = outputSheet.getRange(startRow, diaperTableStartCol, DIAPER_NUM_ROWS, diaperTableNumCols);
     diaperTableRange.setValues(diaperDataForSetValues);
 
-    // 2. Apply Merging for the Header and Data Rows
+    // --- 2. Apply Merging ---
     
-    // Header Merging (Row 7)
-    // A7: "Size/Weight Ranges" is NOT merged (It was F7:G7) -> Now A7:A7 (1 column)
-    outputSheet.getRange(diaperTableStartRow, 2, 1, 4).merge(); // B7:E7 (Desc)
-    // F7: "Code" is NOT merged (It was A7:A7) -> Now F7:G7 (2 columns - Adjusted for visual balance)
-    outputSheet.getRange(diaperTableStartRow, 6, 1, 2).merge(); // F7:G7 (Code)
-    outputSheet.getRange(diaperTableStartRow, 8, 1, 2).merge(); // H7:I7 (PreOrdered)
-    outputSheet.getRange(diaperTableStartRow, 10, 1, 4).merge(); // J7:M7 (NotOrdered)
-    outputSheet.getRange(diaperTableStartRow, 14, 1, 2).merge(); // N7:O7 (Not Fulfilled)
+    // Header Merging (startRow)
+    outputSheet.getRange(startRow, 2, 1, 4).merge();  // B:E (Desc)
+    outputSheet.getRange(startRow, 6, 1, 2).merge();  // F:G (Code)
+    outputSheet.getRange(startRow, 8, 1, 2).merge();  // H:I (PreOrdered)
+    outputSheet.getRange(startRow, 10, 1, 4).merge(); // J:M (NotOrdered)
+    outputSheet.getRange(startRow, 14, 1, 2).merge(); // N:O (Not Fulfilled)
 
-    // Data Rows Merging (Row 8 to End) - Merge PER ROW
-    const firstDataRow = diaperTableStartRow + 1; 
-    const numDataRows = DIAPER_NUM_ROWS - 1; 
+    // Data Rows Merging (startRow + 1 to End)
+    const firstDataRow = startRow + 1; 
+    const numDataRows = DIAPER_NUM_ROWS - 1; // 21 rows of data
 
     for (let r = firstDataRow; r < firstDataRow + numDataRows; r++) {
-        // A: Size/Weight Ranges - No Merge (1 column)
         // Merge Size Description (B:E)
         outputSheet.getRange(r, 2, 1, 4).merge(); 
-        // Merge Code (F:G) - Adjusted to 2 columns for visual balance
+        // Merge Code (F:G)
         outputSheet.getRange(r, 6, 1, 2).merge(); 
         // Merge PreOrdered (H:I)
         outputSheet.getRange(r, 8, 1, 2).merge(); 
@@ -337,36 +1318,32 @@ function generateSpecialItemsCoordinator() {
         outputSheet.getRange(r, 14, 1, 2).merge();
     }
     
-    // 3. Apply Formatting
+    // --- 3. Apply Formatting ---
+    
+    // Apply basic borders and background to the whole table
     diaperTableRange
         .setBorder(true, true, true, true, true, true)
         .setBackground("#F3F3F3") 
         .setFontSize(12);
-    
-    // Header Formatting (Row 7)
-    outputSheet.getRange(diaperTableStartRow, diaperTableStartCol, 1, diaperTableNumCols)
+
+    // Header Formatting (Row startRow)
+    outputSheet.getRange(startRow, diaperTableStartCol, 1, diaperTableNumCols)
         .setFontWeight("bold")
-        .setBackground("#CCCCCC") 
+        .setBackground("#CCCCCC") // Darker Gray
         .setHorizontalAlignment("center")
         .setVerticalAlignment("middle")
         .setWrap(true);
         
-    // Apply specific formatting to the "Total Diaper Packs" row
-    const totalRowIndex = firstDataRow + rawDiaperSizes.length; 
-    outputSheet.getRange(totalRowIndex, 1, 1, diaperTableNumCols)
-        .setFontWeight("bold")
-        .setBackground("#CFE2F3"); // Light Blue color
-        
-    // Set alignment for all data rows (A8 to Oxx)
-    outputSheet.getRange(firstDataRow, diaperTableStartCol, numDataRows, 1).setHorizontalAlignment("center"); // Range (A) - Now the Range column
-    outputSheet.getRange(firstDataRow, 2, numDataRows, 4).setHorizontalAlignment("left").setWrap(true); // Description (B:E merged)
-    outputSheet.getRange(firstDataRow, 6, numDataRows, 2).setHorizontalAlignment("center"); // Code (F:G merged) - Now the Code column
-    outputSheet.getRange(firstDataRow, 8, numDataRows, 2).setHorizontalAlignment("center"); // PreOrdered (H:I merged)
-    outputSheet.getRange(firstDataRow, 10, numDataRows, 4).setHorizontalAlignment("center"); // NotOrdered (J:M merged)
-    outputSheet.getRange(firstDataRow, 14, numDataRows, 2).setHorizontalAlignment("center"); // Not Fulfilled (N:O merged)
+    // Set alignment for all data rows (startRow + 1 to End)
+    // Range (A)
+    outputSheet.getRange(firstDataRow, diaperTableStartCol, numDataRows, 1).setHorizontalAlignment("center"); 
+    // Description (B:E merged)
+    outputSheet.getRange(firstDataRow, 2, numDataRows, 4).setHorizontalAlignment("left").setWrap(true); 
+    // Code, PreOrdered, NotOrdered, Not Fulfilled (F to O)
+    outputSheet.getRange(firstDataRow, 6, numDataRows, 10).setHorizontalAlignment("center"); 
     
     // === ALTERNATING ROW SHADING (excluding Total and Wipes) ===
-    const regularDiaperRows = rawDiaperSizes.length;
+    const regularDiaperRows = rawDiaperSizes.length; // 19 rows of actual sizes
     for (let r = 0; r < regularDiaperRows; r++) {
         // Row index in the sheet is firstDataRow + r
         if (r % 2 !== 0) { // Apply shading to odd-indexed rows (r=1, 3, 5...)
@@ -378,879 +1355,316 @@ function generateSpecialItemsCoordinator() {
         }
     }
     
+    // Apply specific formatting to the "Total Diaper Packs" row
+    const totalRowIndex = firstDataRow + rawDiaperSizes.length; // 19th row of data (index 19 in data array)
+    outputSheet.getRange(totalRowIndex, 1, 1, diaperTableNumCols)
+        .setFontWeight("bold")
+        .setBackground("#CFE2F3"); // Light Blue color
+        
     // Set the Wipes row to a neutral/light shade for distinction
-    const wipesRowIndex = totalRowIndex + 1;
+    const wipesRowIndex = totalRowIndex + 1; // 20th row of data
     outputSheet.getRange(wipesRowIndex, 1, 1, diaperTableNumCols)
         .setFontWeight("bold")
         .setBackground("#D9EAD3"); // Light Mint Green color
 
     // === HEAVIER BORDER LINES at logical breaks ===
-    const borderStyle = SpreadsheetApp.BorderStyle.SOLID_MEDIUM; // Medium thickness border
+    const borderStyle = SpreadsheetApp.BorderStyle.SOLID_MEDIUM; 
     const borderColor = "#000000";
 
+    // Helper to find the 0-based index of a code in the rawDiaperSizes array
+    const findIndexInRawSizes = (code) => rawDiaperSizes.findIndex(d => d[0] === code);
+
     // 1. After Size 7 Diapers (baby/toddler separation)
-    const afterSize7RowIndex = firstDataRow + rawDiaperSizes.findIndex(d => d[0] === "7"); // Index 7 (8th row)
+    // Index 7 in rawDiaperSizes (8th row of data)
+    const afterSize7RowIndex = firstDataRow + findIndexInRawSizes("7"); 
     outputSheet.getRange(afterSize7RowIndex, diaperTableStartCol, 1, diaperTableNumCols)
         .setBorder(null, null, true, null, null, null, borderColor, borderStyle);
 
     // 2. After 6T/7T PullUps (pull-ups separation)
-    const after6T7TRowIndex = firstDataRow + rawDiaperSizes.findIndex(d => d[0] === "6/7T"); // Index 12 (13th row)
+    // Index 12 in rawDiaperSizes (13th row of data)
+    const after6T7TRowIndex = firstDataRow + findIndexInRawSizes("6/7T"); 
     outputSheet.getRange(after6T7TRowIndex, diaperTableStartCol, 1, diaperTableNumCols)
         .setBorder(null, null, true, null, null, null, borderColor, borderStyle);
 
-    // 3. After MALXD (masculine adult separation)
-    const afterMALXDRowIndex = firstDataRow + rawDiaperSizes.findIndex(d => d[0] === "MALXD"); // Index 14 (15th row)
-    outputSheet.getRange(afterMALXDRowIndex, diaperTableStartCol, 1, diaperTableNumCols)
+    // 3. After AdXXL (adult separation)
+    // Index 14 in rawDiaperSizes (15th row of data)
+    const afterAdSmlRowIndex = firstDataRow + findIndexInRawSizes("AdXXL");
+    outputSheet.getRange(afterAdSmlRowIndex, diaperTableStartCol, 1, diaperTableNumCols)
         .setBorder(null, null, true, null, null, null, borderColor, borderStyle);
+    
+    return startRow + DIAPER_NUM_ROWS; // Return next available row after the table
+}
 
-    // ====================================================================
-
-    // Row 30 timestamp 
-    const LIGHT_GRAY = "#EFEFEF";
-    const timestamp = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy/MM/dd HH:mm:ss");
+function generateTimestamp(outputSheet, timestampRow) {
+    const timestamp = Utilities.formatDate(new Date(), SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(), "yyyy/MM/dd HH:mm:ss");
     const timestampMessage = `This Packing List Tab was generated on ${timestamp}.`;
-    const timestampRow = 30; // Adjusted row
-    const timestampRange = outputSheet.getRange(timestampRow, 1, 1, 15); // Start at A30, span 15 columns (A30:O30)
+    const timestampRange = outputSheet.getRange(timestampRow, 1, 1, 15); 
 
     timestampRange.merge()
-        .setValue(timestampMessage) // Set the actual formatted timestamp
+        .setValue(timestampMessage)
         .setFontSize(16)
         .setFontWeight("bold")
-        .setWrap(true)
-        .setBackground(LIGHT_GRAY);
+        .setBackground("#EFEFEF");
+    
+    return timestampRow + 3; // Space buffer for routes to start
+}
 
-    let outputRow = 33; // Starts on Row 33
+function generatePackingListRouteSections(outputSheet, dataRowsForDiaperCount, headers, routeDriverMap, diaperCounts, indices, outputRow) {
+    const keywords = ["gluten", "dairy", "vegan", "vegetarian", "allergy", "nut", "tomato", "tomatos", "tomatoes", "soy", "lactose", "plant", "extra", "no", "non", "not"];
+    
+    // 1. Get unique routes and SORT them alphabetically
+    const routes = [...new Set(dataRowsForDiaperCount.map(r => String(r[indices.routeIdx]).trim()).filter(r => r))].sort();
 
-    // === Route sections ===
-    const routes = [...new Set(dataRows.map(r => String(r[routeIdx]).trim()).filter(r => r))]; 
-    const routeColors = [
-        "#D9EAD3", // Light Mint Green
-        "#FFF2CC", // Light Yellow / Cream
-        "#FCE5CD", // Light Peach / Pale Orange
-        "#D9D2E9", // Light Lavender / Pale Violet
-        "#CFE2F3", // Pale Blue
-        "#EEDD82", // New: Light Goldenrod
-        "#E0F7FA", // Very Light Cyan / Aqua
-        "#F8BBD0", // Light Pink / Rose
-        "#E8F5E9", // Very Light Green / Mint
-        "#FAEBD7", // New: Antique White (Off-White/Beige)
-        "#FFCCBC", // Light Salmon / Light Coral
-        "#C5CAE9", // Light Periwinkle
-        "#9ACD32"  // New: Yellow-Green
+    // --- CONFIGURATION OPTIONS ---
+    const USE_GREY_SHADE = true;
+    const NEUTRAL_GREY = "#E0E0E0";
+    const USE_DARKER_SHADE = true;
+
+    const alternatingColorPairs = [
+        ["#D9EAD3", "#F0FDF0"], ["#FFF2CC", "#FFFFFA"], ["#FCE5CD", "#FFF9F4"], 
+        ["#D9D2E9", "#F0F0FC"], ["#CFE2F3", "#F0F8FF"], ["#EEDD82", "#FFFFE5"], 
+        ["#E0F7FA", "#F0FFFF"], ["#F8BBD0", "#FFF0F5"], ["#E8F5E9", "#F0FFF0"], 
+        ["#FAEBD7", "#FFFBF5"], ["#FFCCBC", "#FFF5F0"], ["#C5CAE9", "#E5E8F5"], 
+        ["#9ACD32", "#F5FFF0"]  
     ];
 
-    // Remove the driver column from the final output
-    const includedIndexesNoDriver = includedIndexes.filter(i => i !== driverIdx);
+    const routeColors = alternatingColorPairs.map(pair => pair[0]);
 
-    // Add 2 new checkbox columns
+    const headerMap = {
+        "Name": "Name", "# packs": "#\npacks", "# eggs": "#\neggs", "# milk": "#\nmilk", 
+        "dogFood(qty)": "#\ndog\nfood", "catFood(qty)": "#\ncat\nfood",
+        "diapers1(size)": "size of\ndiapers", "diapers2(size)": "size of\ndiapers",
+        "diapers3(size)": "size of\ndiapers", "wipes(qty)": "#\nwipes",
+        "toiletries(qty)": "#\nToilet-\nries", "fem hygiene(qty)": "#\nFem\nHygiene",
+        "Special Item Requests": "Special Item\nRequests",
+        "Packed up & labeled?": "Packed\nup and\nlabeled?", "Picked up by driver?": "Picked\nup by\ndriver?" 
+    };
+
+    const includedIndexesNoDriver = indices.includedIndexes.filter(i => i !== indices.driverIdx);
     const checkboxHeaders = ["Packed up & labeled?", "Picked up by driver?"];
-    const finalHeaders = includedIndexesNoDriver.map(i => headers[i]).concat(checkboxHeaders);
-    
-    // Helper to get 1-based column index relative to finalHeaders
-    const colIndex = name => finalHeaders.indexOf(name) + 1;
+    const finalHeaders = includedIndexesNoDriver.map(i => headerMap[headers[i]] || headers[i]).concat(checkboxHeaders.map(h => headerMap[h] || h));
+    const numCols = finalHeaders.length; 
+    const lastColIndex = numCols;
+    const colIndex = name => finalHeaders.indexOf(name) + 1; 
 
+    const DOTTED = SpreadsheetApp.BorderStyle.DOTTED;
+    const MEDIUM_SOLID = SpreadsheetApp.BorderStyle.SOLID_MEDIUM;
+    const BLACK = "#000000";
+    const WHITE = "#FFFFFF";
+
+    // 2. MAIN LOOP - This now iterates through the SORTED routes list
     routes.forEach((route, i) => {
         const driver = routeDriverMap[route] || "TBD";
         const routeColor = routeColors[i % routeColors.length];
+        const colorPair = alternatingColorPairs[i % alternatingColorPairs.length];
         
-        const checkStart = colIndex("Packed up & labeled?");
+        let shadedColor = USE_GREY_SHADE ? NEUTRAL_GREY : (USE_DARKER_SHADE ? colorPair[0] : colorPair[1]);
         
-        // === Data filtering (Filter by Route AND Confirmed 'YES' OR 'NO ANS') ===
-        const filteredDataRows = dataRowsForDiaperCount // Reuse the filtered data for consistency
-            .filter(r => String(r[routeIdx]).trim() === route);
+        // Filter rows specifically for THIS route in the loop
+        const filteredDataRows = dataRowsForDiaperCount.filter(r => String(r[indices.routeIdx]).trim() === route);
+        
+        if (filteredDataRows.length === 0) return;
 
-        const specialItemsColIndexInOutput = finalHeaders.indexOf("Special Item Requests");
-        const rowsToBold = []; 
+        const specialItemsColIndexInOutput = finalHeaders.indexOf("Special Item\nRequests"); 
+        const rowsForSheet = [];
+        const richTextObjects = []; 
 
-        const plainRows = filteredDataRows
-            .map((r, rowIndex) => includedIndexesNoDriver.map((idx, col) => {
+        filteredDataRows.forEach((r, rowIndex) => {
+            const rowData = includedIndexesNoDriver.map((idx, col) => {
                 let value = r[idx];
-                
-                // Truncate the Name column (col === 0 in the output)
                 if (col === 0 && headers[idx] === "Name" && typeof value === 'string') {
                     const maxLength = 36;
                     value = value.length > maxLength ? value.substring(0, maxLength - 3).trim() + '...' : value;
                 } 
-                
-                // Check for non-empty Special Item Requests and track for bolding
                 if (col === specialItemsColIndexInOutput) {
                     const strValue = String(value || '').trim();
-                    
-                    const lowerStrValue = strValue.toLowerCase();
-                    const shouldBold = keywords.some(keyword => 
-                        lowerStrValue.includes(keyword)
-                    );
-
-                    if (shouldBold) {
-                        rowsToBold.push(rowIndex); 
+                    if (strValue.length > 0) {
+                        richTextObjects.push({
+                            rowIndex: rowIndex,
+                            colIndex: colIndex("Special Item\nRequests"),
+                            richText: createPartiallyBoldedText(strValue, keywords)
+                        });
                     }
                     return strValue; 
                 }
-
                 return value;
-            }).concat(["", ""])); // Add empty strings for checkbox columns
-        
-
-        if (plainRows.length === 0) {
-            outputRow += 2; // Increased from 1 to 2 spacer rows
-            return;
-        }
-
-        // === Totals Calculation ===
-        const totals = {
-            packs: 0, eggs: 0, milk: 0, dogFood: 0, catFood: 0, wipes: 0, toiletries: 0, femHygiene: 0
-        };
-
-        filteredDataRows.forEach(r => {
-            totals.packs += parseFloat(r[packsOrigIdx] || 0) || 0;
-            totals.eggs += parseFloat(r[eggsOrigIdx] || 0) || 0;
-            totals.milk += parseFloat(String(r[milkOrigIdx]).replace('*', '') || 0) || 0;
-            totals.dogFood += parseFloat(r[dogFoodOrigIdx] || 0) || 0;
-            totals.catFood += parseFloat(r[catFoodOrigIdx] || 0) || 0;
-            totals.wipes += parseFloat(r[wipesOrigIdx] || 0) || 0;
-            totals.toiletries += parseFloat(r[toiletriesOrigIdx] || 0) || 0;
-            totals.femHygiene += parseFloat(r[femHygieneOrigIdx] || 0) || 0;
+            });
+            rowsForSheet.push(rowData.concat(["", ""]));
         });
 
-        // === Route header === (Row: outputRow)
-        const startCol = 1; 
-        const mergeCols = finalHeaders.length - (startCol - 1);
-        const headerRange = outputSheet.getRange(outputRow, startCol, 1, mergeCols);
-
-        outputSheet.getRange(outputRow, startCol) 
-            .setValue(`Driver:   ${driver}   |   Route:   ${route}`)
-            .setFontWeight("bold")
-            .setBackground(routeColor)
-            .setHorizontalAlignment("left")
-            .setWrap(false)
-            .setFontSize(14)
-            .setFontWeight("bold");
-        
-        headerRange.mergeAcross(); 
+        // DRAW HEADER
+        const headerRange = outputSheet.getRange(outputRow, 1, 1, numCols);
+        headerRange.mergeAcross().setValue(`Driver:   ${driver}   |   Route:   ${route}`)
+            .setFontSize(14).setFontWeight("bold").setBackground(routeColor).setHorizontalAlignment("left");
         outputRow++;
 
-        // === Column headers === (Row: outputRow)
-        outputSheet.getRange(outputRow, 1, 1, finalHeaders.length)
-            .setValues([finalHeaders])
-            .setFontWeight("bold")
-            .setBackground(routeColor)
-            .setTextRotation(75)
-            .setVerticalAlignment("middle");
-        const dataHeaderRow = outputRow; // Store header row index for borders
+        // DRAW COLUMN HEADERS
+        const dataHeaderRow = outputRow;
+        const columnHeaderRange = outputSheet.getRange(dataHeaderRow, 1, 1, numCols);
+        columnHeaderRange.setValues([finalHeaders]).setFontWeight("bold").setBackground(routeColor)
+            .setVerticalAlignment("middle").setWrap(true).setHorizontalAlignment("center")
+            .setBorder(true, true, true, true, false, true, BLACK, DOTTED);
+        outputSheet.getRange(dataHeaderRow, lastColIndex, 1, 1).setBorder(true, true, true, true, false, false, BLACK, DOTTED);
         outputRow++;
 
-        // === Data rows === (Start Row: outputRow)
-        const range = outputSheet.getRange(outputRow, 1, plainRows.length, finalHeaders.length);
-        
-        range.setValues(plainRows);
-        range.setFontSize(12);
-        
-        if (rowsToBold.length > 0) {
-            rowsToBold.forEach(rowIndex => {
-                outputSheet.getRange(outputRow + rowIndex, 1, 1, finalHeaders.length)
-                    .setFontWeight("bold");
-            });
-        }
-        
-        for (let j = 0; j < plainRows.length; j++) {
-            outputSheet.getRange(outputRow + j, 1, 1, finalHeaders.length)
-                .setBackground(j % 2 === 0 ? "#FFFFFF" : "#F0F0F0");
+        // DRAW DATA ROWS
+        const dataStartRow = outputRow;
+        const numDataRows = rowsForSheet.length;
+        const dataRange = outputSheet.getRange(dataStartRow, 1, numDataRows, numCols);
+        dataRange.setValues(rowsForSheet).setFontSize(12);
+
+        for (let j = 0; j < numDataRows; j++) {
+            const rowRange = outputSheet.getRange(dataStartRow + j, 1, 1, numCols);
+            rowRange.setBackground(j % 2 === 0 ? WHITE : shadedColor);
+            outputSheet.getRange(dataStartRow + j, 1, 1, numCols - 1).setBorder(true, true, true, true, true, false, BLACK, DOTTED);
+            outputSheet.getRange(dataStartRow + j, lastColIndex, 1, 1).setBorder(true, true, true, true, true, false, BLACK, DOTTED); 
         }
 
-        const packedCol = includedIndexesNoDriver.length + 1;
-        outputSheet.getRange(outputRow, packedCol, plainRows.length, 2).insertCheckboxes();
+        richTextObjects.forEach(item => {
+            outputSheet.getRange(dataStartRow + item.rowIndex, item.colIndex).setRichTextValue(item.richText);
+        });
 
-        outputRow += plainRows.length; 
-        const dataEndRow = outputRow - 1; // Last data row index
+        outputSheet.getRange(dataStartRow, includedIndexesNoDriver.length + 1, numDataRows, 2).insertCheckboxes();
+        outputRow += numDataRows; 
 
-        // === Totals Row === (Row: outputRow)
-        const totalsRowData = new Array(finalHeaders.length).fill("");
-        const packsCol = colIndex("# packs") - 1; 
-        const eggsCol = colIndex("# eggs") - 1;
-        const milkCol = colIndex("# milk") - 1;
-        const dogFoodCol = colIndex("dogFood(qty)") - 1;
-        const catFoodCol = colIndex("catFood(qty)") - 1;
-        const wipesCol = colIndex("wipes(qty)") - 1;
-        const toiletriesCol = colIndex("toiletries(qty)") - 1;
-        const femHygieneCol = colIndex("fem hygiene(qty)") - 1;
-
-        totalsRowData[0] = "TOTALS"; 
-        totalsRowData[packsCol] = totals.packs;
-        totalsRowData[eggsCol] = totals.eggs;
-        totalsRowData[milkCol] = totals.milk;
-        totalsRowData[dogFoodCol] = totals.dogFood;
-        totalsRowData[catFoodCol] = totals.catFood;
-        totalsRowData[wipesCol] = totals.wipes;
-        totalsRowData[toiletriesCol] = totals.toiletries;
-        totalsRowData[femHygieneCol] = totals.femHygiene;
-
-
-        const totalsRange = outputSheet.getRange(outputRow, 1, 1, finalHeaders.length);
-        totalsRange.setValues([totalsRowData]);
-        totalsRange.setBackground(routeColor);
-        totalsRange.setFontWeight("bold");
-        totalsRange.setHorizontalAlignment("center");
-        outputSheet.getRange(outputRow, 1).setHorizontalAlignment("left"); 
-
-        if (checkStart > 0) {
-            outputSheet.getRange(outputRow, checkStart, 1, 2).clearDataValidations();
-        }
-        const totalsRow = outputRow; // Store totals row index
-        outputRow++; 
-
-        // === Borders (Start at Header Row, End at Totals Row) ===
-        // The total number of rows for the border is the header + data rows + totals row.
-        const borderRangeStart = dataHeaderRow; // Start at the Column Headers row
-        const totalRowsForBorder = plainRows.length + 2; // Header (1) + Data (N) + Totals (1)
-
-        const borderStyleRoute = SpreadsheetApp.BorderStyle.SOLID_MEDIUM;
-        
-        // --- Logic to apply vertical borders from Header to Totals Row ---
-
-        const milkColEnd = colIndex("# milk");
-        if (milkColEnd > 0) {
-             outputSheet.getRange(borderRangeStart, milkColEnd, totalRowsForBorder, 1)
-                 .setBorder(null, null, null, true, null, null, "#000000", borderStyleRoute);
-        }
-
-        const packsStart = colIndex("# packs");
-        const packsEnd = colIndex("catFood(qty)");
-        if (packsStart > 0 && packsEnd > 0) {
-            outputSheet.getRange(borderRangeStart, packsStart, totalRowsForBorder, 1)
-                .setBorder(null, true, null, null, null, null, "#000000", borderStyleRoute);
-            outputSheet.getRange(borderRangeStart, packsEnd, totalRowsForBorder, 1)
-                .setBorder(null, null, null, true, null, null, "#000000", borderStyleRoute);
-        }
-
-        const diapersStart = colIndex("diapers1(size)");
-        const diapersEnd = colIndex("wipes(qty)");
-        if (diapersStart > 0 && diapersEnd > 0) {
-            outputSheet.getRange(borderRangeStart, diapersStart, totalRowsForBorder, 1)
-                .setBorder(null, true, null, null, null, null, "#000000", borderStyleRoute);
-            outputSheet.getRange(borderRangeStart, diapersEnd, totalRowsForBorder, 1)
-                .setBorder(null, null, null, true, null, null, "#000000", borderStyleRoute);
-        }
-
-        const hygieneStart = colIndex("toiletries(qty)");
-        const hygieneEnd = colIndex("fem hygiene(qty)");
-        if (hygieneStart > 0 && hygieneEnd > 0) {
-            outputSheet.getRange(borderRangeStart, hygieneStart, totalRowsForBorder, 1)
-                .setBorder(null, true, null, null, null, null, "#000000", borderStyleRoute);
-            outputSheet.getRange(borderRangeStart, hygieneEnd, totalRowsForBorder, 1)
-                .setBorder(null, null, null, true, null, null, "#000000", borderStyleRoute);
-        }
-
-        const specialIdx = colIndex("Special Item Requests");
-        if (specialIdx > 0) {
-            outputSheet.getRange(borderRangeStart, specialIdx, totalRowsForBorder, 1)
-                .setBorder(null, true, null, null, null, null, "#000000", SpreadsheetApp.BorderStyle.DOTTED);
-        }
-
-        const checkStartCol = colIndex("Packed up & labeled?");
-        if (checkStartCol > 0) {
-            outputSheet.getRange(borderRangeStart, checkStartCol, totalRowsForBorder, 1)
-                .setBorder(null, true, null, null, null, null, "#000000", SpreadsheetApp.BorderStyle.DOTTED);
-        }
-        
-        // --- Add horizontal border below the Totals Row (outputRow - 1) ---
-        outputSheet.getRange(totalsRow, startCol, 1, finalHeaders.length)
-            .setBorder(null, null, true, null, null, null, "#000000", borderStyleRoute);
-
-
-        // === Spacer Row 1 (Was Spacer Row 2) ===
-        const unshadedSpacerRange1 = outputSheet.getRange(outputRow, 1, 1, finalHeaders.length);
-        unshadedSpacerRange1.clearContent();
-        unshadedSpacerRange1.clearFormat(); 
-        if (checkStart > 0) {
-            outputSheet.getRange(outputRow, checkStart, 1, 2).clearDataValidations();
-        }
+        // DRAW TOTALS ROW
+        const totalsRange = outputSheet.getRange(outputRow, 1, 1, numCols);
+        totalsRange.setBackground(routeColor).setFontWeight("bold").setBorder(true, true, true, true, false, true);
+        outputSheet.getRange(outputRow, lastColIndex).setBorder(true, true, true, true, false, false);
         outputRow++; 
         
-        // === Spacer Row 2 (New) ===
-        const unshadedSpacerRange2 = outputSheet.getRange(outputRow, 1, 1, finalHeaders.length);
-        unshadedSpacerRange2.clearContent();
-        unshadedSpacerRange2.clearFormat(); 
-        if (checkStart > 0) {
-            outputSheet.getRange(outputRow, checkStart, 1, 2).clearDataValidations();
-        }
-        outputRow++; 
+        // APPLY THICK BORDERS
+        const borderAfterColumns = [
+            colIndex("Name"), colIndex("#\nmilk"), colIndex("#\ncat\nfood"),
+            colIndex("#\nwipes"), colIndex("#\nFem\nHygiene"),
+            colIndex("Special Item\nRequests"), colIndex("Picked\nup by\ndriver?")
+        ];
+        
+        borderAfterColumns.forEach(col => {
+            if (col > 0 && col <= numCols) {
+                outputSheet.getRange(dataHeaderRow, col, numDataRows + 2, 1).setBorder(null, null, null, true, null, null, BLACK, MEDIUM_SOLID);
+            }
+        });
+        
+        outputRow += 1; // Spacer
     });
 
-    // === Column sizing ===
+    return outputRow;
+}
+
+function applyPackingListFinalColumnSizing(outputSheet, includedIndexes, driverIdx, headers) {
     
-    // Column A: Size/Weight Ranges (New position - was F)
+    // Find final headers (excluding driver, adding checkboxes)
+    const includedIndexesNoDriver = includedIndexes.filter(i => i !== driverIdx);
+    const checkboxHeaders = ["Packed up & labeled?", "Picked up by driver?"];
+    const finalHeaders = includedIndexesNoDriver.map(i => headers[i]).concat(checkboxHeaders);
+    
+    // Set widths for Summary/Diaper Table Columns A-M
     outputSheet.setColumnWidth(1, 175); 
+    for(let i = 2; i <= 13; i++) {
+        outputSheet.setColumnWidth(i, 60); 
+    }
 
-    // Summary/Diaper Table Columns B-M
-    outputSheet.setColumnWidth(2, 60); 
-    outputSheet.setColumnWidth(3, 60); 
-    outputSheet.setColumnWidth(4, 60); 
-    outputSheet.setColumnWidth(5, 60); 
-    outputSheet.setColumnWidth(6, 60); // Column F: Code (New position - was A)
-    outputSheet.setColumnWidth(7, 60); 
-    outputSheet.setColumnWidth(8, 60); 
-    outputSheet.setColumnWidth(9, 60); 
-    outputSheet.setColumnWidth(10, 60); 
-    outputSheet.setColumnWidth(11, 60); 
-    outputSheet.setColumnWidth(12, 60); 
-    outputSheet.setColumnWidth(13, 60); 
-
-    // Auto-size all data columns starting after M (Column N = 14) onwards
+    // Auto-size all data columns starting after M (Column 14) onwards
     if (finalHeaders.length > 13) {
         outputSheet.autoResizeColumns(14, finalHeaders.length - 13); 
     }
     
+    // Specific width for 'Special Item Requests' and text wrap
     const specialIdx = finalHeaders.indexOf("Special Item Requests");
     if (specialIdx !== -1) {
         const col = specialIdx + 1;
-        outputSheet.setColumnWidth(col, 250);
+        outputSheet.setColumnWidth(col, 410);
         // Apply wrap starting from the route-specific data rows (Row 33)
         outputSheet.getRange(33, col, outputSheet.getLastRow() - 32, 1).setWrap(true);
     }
 
+    // Specific width for Checkboxes
     const checkboxStartCol = finalHeaders.indexOf("Packed up & labeled?");
     if (checkboxStartCol !== -1) {
-        const col1 = checkboxStartCol + 1;
-        const col2 = checkboxStartCol + 2;
-        outputSheet.setColumnWidth(col1, 140);
-        outputSheet.setColumnWidth(col2, 140);
+        outputSheet.setColumnWidth(checkboxStartCol + 1, 60);
+        outputSheet.setColumnWidth(checkboxStartCol + 2, 60);
     }
-    
-    SpreadsheetApp.flush();
-
-    return timestamp;
 }
 
-function makeTheLabels() {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const dataSheet = ss.getSheetByName("Deliveries-UPDATE HERE");
-    const outputSheetName = "DeliveryLabels";
-    let outputSheet = ss.getSheetByName(outputSheetName);
-
-    const timestamp = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy/MM/dd HH:mm:ss");
-
-    // --- NEW: Calculate the desired insertion index and log details ---
-    let targetIndex;
-    
-    if (dataSheet) {
-        // Log the details of the source sheet
-        Logger.log(`Source Sheet ("${dataSheet.getName()}") Index: ${dataSheet.getIndex()}`);
-
-        // FIX: Insert the new sheet immediately AFTER the source data sheet.
-        // Sheets are 1-indexed. To place AFTER index N, we use N + 1.
-        targetIndex = dataSheet.getIndex() + 1; 
-        
-        // Log the calculated index
-        Logger.log(`Calculated Target Index (Insert AFTER data sheet): ${targetIndex}`);
-        
-        // If you wanted it at the very end, regardless of location, you would use:
-        // targetIndex = ss.getNumSheets(); 
-    } else {
-        // Fallback: Insert at the very end of the sheet list if the data sheet is not found.
-        targetIndex = ss.getNumSheets();
-        Logger.log(`Source sheet "Deliveries-UPDATE HERE" not found. Inserting at the end (Index: ${targetIndex}).`);
-    }
-    // ----------------------------------------------------
-
-    // Only insert the sheet if it doesn't already exist.
-    if (!outputSheet) {
-        // We now use the calculated targetIndex instead of the hardcoded 0.
-        outputSheet = ss.insertSheet(outputSheetName, targetIndex); 
-        Logger.log(`Output sheet created at index: ${outputSheet.getIndex()}`);
-    } else {
-        // If the sheet already exists, its position is not changed by this function
-        Logger.log(`Output sheet ("${outputSheetName}") found at index: ${outputSheet.getIndex()}. Position not changed.`);
-    }
-
-    // Completely clear previous content, formatting, filters
-    outputSheet.clear();
-    outputSheet.setFrozenRows(0);
-    outputSheet.setFrozenColumns(0);
-
-    const data = dataSheet.getDataRange().getValues();
-    const headers = data[0];
-    const dataRows = data.slice(1);
-
-    // --- 1. Identify Key Indices ---
-    const nameIdx = headers.indexOf("Name");
-    const routeIdx = headers.indexOf("routeDescription");
-    
-    // Locate the "Conf for" column (case-insensitive find)
-    const confForHeader = headers.find(h => typeof h === 'string' && h.trim().startsWith("Conf for"));
-    const confForIdx = confForHeader ? headers.indexOf(confForHeader) : -1;
-
-    // Indices for Bag Count Calculation
-    const diapers1Idx = headers.indexOf("diapers1(size)");
-    const diapers2Idx = headers.indexOf("diapers2(size)");
-    const diapers3Idx = headers.indexOf("diapers3(size)");
-    const wipesIdx = headers.indexOf("wipes(qty)");
-    const dogFoodIdx = headers.indexOf("dogFood(qty)");
-    const catFoodIdx = headers.indexOf("catFood(qty)");
-
-    // Safety check for required columns
-    if (nameIdx === -1 || routeIdx === -1 || confForIdx === -1) {
-        Logger.log("Missing essential columns (Name, routeDescription, or Conf for *). Cannot generate labels.");
-        SpreadsheetApp.getUi().alert("Missing essential columns (Name, routeDescription, or Conf for *). Cannot generate labels.");
-        return;
-    }
-
-    // --- 2. Build Route-Driver Mapping ---
-    const helperSheet = ss.getSheetByName("DeliveriesHelpTable");
-    const routeDriverMap = {};
-    if (helperSheet) {
-        const helperData = helperSheet.getDataRange().getValues().slice(1);
-        helperData.forEach(row => { 
-            const routeKey = String(row[0] || '').trim();
-            const driverValue = String(row[1] || '').trim();
-            if (routeKey) routeDriverMap[routeKey] = driverValue; 
-        });
-    }
-
-    // --- 3. Filter Data and Process Each Delivery Row ---
-    const deliveriesData = [];
-    const labelFontSizeMap = {}; // Maps the delivery index to font sizes
-    let deliveryIndexCounter = 0; // Counter for mapping purposes
-
-    const filteredDataRows = dataRows
-        // Filter by Conf for * = 'YES' or includes 'NO ANS'
-        .filter(row => {
-            const confValue = String(row[confForIdx] || '').toUpperCase().trim();
-            return confValue === 'YES' || confValue.includes('NO ANS');
-        });
-
-    filteredDataRows.forEach(row => {
-        const name = String(row[nameIdx] || 'UNKNOWN NAME');
-        const route = String(row[routeIdx] || 'UNKNOWN ROUTE').trim();
-        const driver = routeDriverMap[route] || "TBD";
-        
-        // Dynamic Font Size Emulation for Name
-        const baseNameFontSize = 12;
-        const reducedNameFontSize = 10;
-        const maxNameLength = 20; 
-        const nameFontSize = name.length > maxNameLength ? reducedNameFontSize : baseNameFontSize;
-
-        // Dynamic Font Size Emulation for Driver (USING USER'S CUSTOM VALUES)
-        const baseDriverFontSize = 13;
-        const reducedDriverFontSize = 11;
-        const maxDriverLength = 20;
-        const driverFontSize = driver.length > maxDriverLength ? reducedDriverFontSize : baseDriverFontSize;
-
-
-        // --- Bag Count Logic (Only counts bulky items) ---
-        let bagCount = 0;
-
-        // A. Diapers: 1 bag per non-empty column (max 3)
-        if (diapers1Idx !== -1 && String(row[diapers1Idx]).trim() !== "") bagCount++;
-        if (diapers2Idx !== -1 && String(row[diapers2Idx]).trim() !== "") bagCount++;
-        if (diapers3Idx !== -1 && String(row[diapers3Idx]).trim() !== "") bagCount++;
-
-        // B. Wipes: 1 bag per whole quantity
-        const wipesQty = parseFloat(row[wipesIdx] || 0) || 0;
-        bagCount += Math.ceil(wipesQty);
-        
-        // C. Pet Food: 1 bag per whole quantity
-        const dogFoodQty = parseFloat(row[dogFoodIdx] || 0) || 0;
-        const catFoodQty = parseFloat(row[catFoodIdx] || 0) || 0;
-        bagCount += Math.ceil(dogFoodQty) + Math.ceil(catFoodQty);
-        
-        // --- IMPLEMENT HARD LIMIT OF 3 LABELS ---
-        bagCount = Math.min(bagCount, 3);
-        
-        if (bagCount > 0) {
-             const delivery = {
-                Name: name,
-                Driver: driver,
-                TotalLabels: bagCount
-            };
-            
-            deliveriesData.push(delivery);
-            
-            // Store font size metadata keyed by the delivery index
-            labelFontSizeMap[deliveryIndexCounter] = { 
-                name: nameFontSize,
-                driver: driverFontSize
-            };
-            deliveryIndexCounter++;
-        }
-    });
-
-    // --- 4. Format Output into Grouped Delivery Layout (2 Rows per Delivery) ---
-    const finalOutput = [];
-    const labelsPerRow = 3;
-    const labelHeightRows = 2; // *** RESTORED: 2 rows per physical label ***
-    const labelWidthCols = 2;  
-    const totalCols = labelsPerRow * labelWidthCols; // 6 columns 
-    
-    // Store the delivery index corresponding to each new row pair for formatting later
-    const outputRowMapping = []; 
-
-    deliveriesData.forEach((delivery, index) => {
-        const row1Data = []; // Name and Bag Numbers
-        const row2Data = []; // Driver Names
-        
-        const numLabelsToGenerate = delivery.TotalLabels;
-
-        for (let j = 0; j < labelsPerRow; j++) {
-            if (j < numLabelsToGenerate) {
-                // Generate content for this label slot
-                const nameLine = `${delivery.Name}`;
-                const detailLine = `${delivery.Driver}`; // Driver Name Only
-                const numberLine = `BAG ${j + 1}/${delivery.TotalLabels}`;
-
-                // Row 1: Name and Bag Number
-                row1Data.push(nameLine, numberLine);
-                // Row 2: Driver Name (Pushed twice for merging later)
-                row2Data.push(detailLine, detailLine); 
-            } else {
-                // Leave the remaining slots blank
-                row1Data.push("", ""); 
-                row2Data.push("", ""); 
-            }
-        }
-        
-        finalOutput.push(row1Data, row2Data); // Push both rows for the delivery
-        // Store the index of the delivery
-        outputRowMapping.push(index);
-    });
-    
-    if (finalOutput.length === 0) {
-        SpreadsheetApp.getUi().alert("No confirmed deliveries with items found to generate labels.");
-        return;
-    }
-    
-    // --- 5. Write Data to Sheet ---
-    
-    outputSheet.getRange(1, 1, finalOutput.length, totalCols).setValues(finalOutput);
-
-    // --- 6. Formatting and Sizing for Avery 6240 (30-up) ---
-    
-    // Set column widths for printing (Columns A/B, C/D, E/F form the 3 labels)
-    //const width = 250;
-    const width = 258; 
-    outputSheet.setColumnWidth(1, width * 0.7); // Name/Route Line (70%)
-    outputSheet.setColumnWidth(2, width * 0.3); // Label Number (30%)
-    outputSheet.setColumnWidth(3, width * 0.7);
-    outputSheet.setColumnWidth(4, width * 0.3);
-    outputSheet.setColumnWidth(5, width * 0.7);
-    outputSheet.setColumnWidth(6, width * 0.3);
-    
-
-    // Loop through the output data rows (2 rows per delivery)
-    for (let r = 1; r <= finalOutput.length; r += labelHeightRows) { 
-        
-        // Calculate the index of the current delivery block in outputRowMapping
-        const deliveryIndex = outputRowMapping[(r - 1) / labelHeightRows];
-        const deliveryInfo = deliveriesData[deliveryIndex];
-        const numLabels = deliveryInfo.TotalLabels;
-
-        // *** RESTORED: Set both Row Heights to 36px (36px + 36px = 72px total label height) ***
-        //outputSheet.setRowHeight(r, 36); // Row 1 (Name/Number)
-        //outputSheet.setRowHeight(r + 1, 36); // Row 2 (Driver)
-        outputSheet.setRowHeight(r, 51.5); // Row 1 (Name/Number)
-        outputSheet.setRowHeight(r + 1, 51.5); // Row 2 (Driver)
-
-        // General Formatting for the Label Block (2 rows x 6 columns)
-        const labelBlock = outputSheet.getRange(r, 1, labelHeightRows, totalCols);
-
-        // Explicitly remove all borders (Top, Bottom, Left, Right, Vertical, Horizontal)
-        labelBlock.setBorder(false, false, false, false, false, false); 
-
-        // Align all content to the middle vertically
-        labelBlock.setFontWeight("bold").setVerticalAlignment("middle").setHorizontalAlignment("center");
-        
-        // --- Apply Dynamic Font Sizing for Names and Drivers ---
-
-        // Get the font sizing metadata for this delivery
-        const formatting = labelFontSizeMap[deliveryIndex];
-        const nameFontSize = formatting ? formatting.name : 12; 
-        const driverFontSize = formatting ? formatting.driver : 13; 
-
-        // Apply formatting across all generated labels in this row pair
-        for (let j = 0; j < numLabels; j++) {
-            const colNameStart = j * 2 + 1; // 1, 3, 5
-            const colBagStart = j * 2 + 2; // 2, 4, 6
-
-            // Row 2: Driver Name Merging (Must happen first)
-            outputSheet.getRange(r + 1, colNameStart, 1, 2).mergeAcross();
-            
-            // Row 1, Name Cell (Dynamic Font Size)
-            outputSheet.getRange(r, colNameStart, 1, 1)
-                .setFontSize(nameFontSize)
-                .setWrap(false)
-                .setFontColor("#000000") // Black color
-                .setHorizontalAlignment("center");
-            
-            // Row 1, Bag Number Cell (Fixed Font Size)
-            outputSheet.getRange(r, colBagStart, 1, 1)
-                .setFontSize(10)
-                .setFontWeight("normal")
-                .setHorizontalAlignment("left");
-
-            // Row 2, Driver Name Cell (Dynamic Font Size) - Applies to the merged range
-            outputSheet.getRange(r + 1, colNameStart, 1, 2)
-                .setFontSize(driverFontSize) // *** DYNAMIC FONT SIZE APPLIED HERE ***
-                .setFontColor("#3C78D8") // Blue color
-                .setHorizontalAlignment("center"); 
-        }
-    }
-
-    // --- Safely delete excess rows and columns ---
-    
-    const maxRows = outputSheet.getMaxRows();
-    const rowsToDelete = maxRows - finalOutput.length;
-    if (rowsToDelete > 0) {
-        outputSheet.deleteRows(finalOutput.length + 1, rowsToDelete);
-    }
-    
-    const maxCols = outputSheet.getMaxColumns();
-    const colsToDelete = maxCols - totalCols;
-    if (colsToDelete > 0) {
-        outputSheet.deleteColumns(totalCols + 1, colsToDelete);
-    }
-    
-    SpreadsheetApp.flush();
-
-    return timestamp;
+function simpleRegexpEscape(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function makeDriverRouteTabs() {
-  Logger.log('Building driver route tabs...');
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const dataSheet = ss.getSheetByName("Deliveries-UPDATE HERE");
-  const indexSheetName = "Driver_Deliveries";
-  const helperFunction = "populateRouteTabs";
-  const timestamp = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy/MM/dd HH:mm:ss");
+function createPartiallyBoldedText(text, keywords) {
+  if (!text || typeof text !== 'string') {
+    return SpreadsheetApp.newRichTextValue().setText(text || '').build();
+  }
 
-  //  CLEANUP PREVIOUS OUTPUT
-  ss.getSheets().forEach(sh => {
-    const name = sh.getName();
-    if (name.startsWith("Route_")) ss.deleteSheet(sh);
+  const builder = SpreadsheetApp.newRichTextValue().setText(text);
+  const boldStyle = SpreadsheetApp.newTextStyle().setBold(true).build();
+
+  const modifiers = ["no", "not", "non", "extra"];
+  const ranges = [];
+
+  // Normalize keywords
+  const normalizedKeywords = (keywords || []).map(k => String(k).toLowerCase());
+
+  // 1) Find keyword matches with STRICT WORD BOUNDARIES
+  normalizedKeywords.forEach(keyword => {
+    if (!keyword) return;
+    // The \\b ensures "ring" matches "ring the bell" but NOT "spring"
+    const re = new RegExp('\\b' + simpleRegexpEscape(keyword) + '\\b', 'gi');
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      ranges.push([m.index, m.index + m[0].length]);
+    }
   });
 
-  let indexSheet = ss.getSheetByName(indexSheetName);
-  if (!indexSheet) indexSheet = ss.insertSheet(indexSheetName);
-  indexSheet.clearContents();
-  indexSheet.clearFormats();
+  // 2) Find modifier occurrences with STRICT WORD BOUNDARIES
+  modifiers.forEach(mod => {
+    const re = new RegExp('\\b' + simpleRegexpEscape(mod) + '\\b', 'gi');
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const modStart = m.index;
+      const modEnd = modStart + m[0].length;
+      ranges.push([modStart, modEnd]);
 
-  // LOAD DATA & INITIAL SETUP
-  const dataRange = dataSheet.getDataRange();
-  const data = dataRange.getValues();
-
-  if (data.length < 2) {
-    SpreadsheetApp.getUi().alert("No data found in data sheet.");
-    return;
-  }
-
-  const headers = data[0].map(h => String(h).trim());
-  let dataRows = data.slice(1);
-
-  // Column Index Lookups
-  const routeColumnIndex = headers.indexOf("routeDescription");
-  const nameColumnIndex = headers.indexOf("Name");
-  const addressColumnIndex = headers.indexOf("Address");
-  const phoneColumnIndex = headers.indexOf("Phone");
-  const specReqsColumnIndex = headers.indexOf("Special Item Requests");
-  const delivInstrColumnIndex = headers.indexOf("Special Delivery Instructions");
-  const deliveryMapLinkIndex = headers.indexOf("Delivery Map Links");
-  // New Indices for Diaper Consolidation
-  const diapers1Idx = headers.indexOf("diapers1(size)");
-  const diapers2Idx = headers.indexOf("diapers2(size)");
-  const diapers3Idx = headers.indexOf("diapers3(size)");
-
-  // Check for required columns
-  if ([routeColumnIndex, nameColumnIndex, addressColumnIndex, phoneColumnIndex].some(idx => idx === -1)) {
-    SpreadsheetApp.getUi().alert("Missing required columns. Ensure 'routeDescription', 'Name', 'Address', and 'Phone' exist.");
-    return;
-  }
-
-  // Confirmation filtering (Yes / No Ans)
-  const confForHeader = headers.find(h => h.startsWith("Conf for"));
-  const confForIdx = confForHeader ? headers.indexOf(confForHeader) : -1;
-  if (confForIdx !== -1) {
-    const filteredData = [];
-    dataRows.forEach((row) => {
-      const val = String(row[confForIdx] || '').toUpperCase().trim();
-      if (val === 'YES' || val.includes('NO ANS')) {
-        filteredData.push(row);
-      }
-    });
-    dataRows = filteredData;
-  }
-
-  // Helper table map: Route → Driver
-  const helperSheet = ss.getSheetByName("DeliveriesHelpTable");
-  const routeDriverMap = {};
-  if (helperSheet) {
-    const helperData = helperSheet.getDataRange().getValues().slice(1);
-    helperData.forEach(r => {
-      const routeKey = String(r[0]).trim();
-      if (routeKey) routeDriverMap[routeKey] = String(r[1]).trim();
-    });
-  }
-
-  // --- START Item Columns to Keep (EMOJI HEADERS) ---
-  const itemMap = [
-    { label: "food", sourceHeader: "# packs", type: 'qty' },
-    { label: "eggs", sourceHeader: "# eggs", type: 'qty' },
-    { label: "milk", sourceHeader: "# milk", type: 'qty' },
-    { label: "dog food", sourceHeader: "dogFood(qty)", type: 'qty' },
-    { label: "cat food", sourceHeader: "catFood(qty)", type: 'qty' },
-    { label: "diapers", sourceIndex: [diapers1Idx, diapers2Idx, diapers3Idx], type: 'diapers' },
-    { label: "wipes", sourceHeader: "wipes(qty)", type: 'qty' },
-    { label: "toiletries", sourceHeader: "toiletries(qty)", type: 'qty' },
-    { label: "fem hygn", sourceHeader: "fem hygiene(qty)", type: 'qty' },
-  ];
-
-  const finalItemHeaders = itemMap.map(item => item.label);
-
-  // --- END Item Columns to Keep ---
-
-  // Group data by Route, now storing only plain rows
-  const routesData = dataRows.reduce((acc, row) => {
-    const route = String(row[routeColumnIndex]).trim();
-    if (route) {
-      if (!acc[route]) acc[route] = {
-        plainRows: [],
-        addresses: new Set(),
-        firstRowIndex: row.join() // Store a key to find the row index later
-      };
-      acc[route].plainRows.push(row);
-      const address = String(row[addressColumnIndex]).trim();
-      if (address) acc[route].addresses.add(address);
-    }
-    return acc;
-  }, {});
-
-  // Colors - UNCHANGED
-  const routeColors = [
-    "#D9EAD3", "#FFF2CC", "#FCE5CD", "#D9D2E9", "#CFE2F3",
-    "#F4CCCC", "#EAD1DC", "#E0F7FA", "#F8BBD0", "#B2EBF2",
-    "#E8F5E9", "#FFF9C4", "#FFCCBC", "#C5CAE9", "#DCEDC8"
-  ];
-
-  // BUILD ROUTE SHEETS (WITH MULTIPLE TABLES)
-  const summary = [["Route", "Driver", "Stops", "Open Sheet"]];
-  const routes = Object.keys(routesData);
-
-  routes.forEach((route, i) => {
-    const routeSafe = route.replace(/[^a-zA-Z0-9]/g, "_").substring(0, 30);
-    const routeColor = routeColors[i % routeColors.length];
-    const driver = routeDriverMap[route] || "TBD";
-
-    // Extract data for the current route
-    const routeData = routesData[route];
-    const routeRows = routeData.plainRows;
-    const routeAddresses = Array.from(routeData.addresses);
-
-    // --- START: MODIFIED LINK/LABEL EXTRACTION ---
-    let routeMapLink = '';
-    let routeMapLabel = '';
-    const defaultLabel = `Open Map for ${route}`;
-    
-    if (deliveryMapLinkIndex !== -1 && routeRows.length > 0) {
-      // Find the index of the first row in the source sheet (data array)
-      const firstRowIndex = data.findIndex(row => row.join() === routeRows[0].join());
-            
-      if (firstRowIndex !== -1) {
-        const sheetRowIndex = firstRowIndex + 1; // 1-based row index
-        const sheetColIndex = deliveryMapLinkIndex + 1; // 1-based column index
-
-        const range = dataSheet.getRange(sheetRowIndex, sheetColIndex);
-        
-        // 1. Get the LABEL first. This is the safest method and always works.
-        // getDisplayValue() returns the visible text, whether it's rich text, a formula result, or plain text.
-        routeMapLabel = String(range.getDisplayValue() || '').trim();
-        
-        // 2. Now, try to get the actual LINK URL.
-        const richTextValue = range.getRichTextValue();
-        
-        // Case A: It's a true Rich Text hyperlink.
-        if (richTextValue && richTextValue.getLinkUrl()) {
-          routeMapLink = richTextValue.getLinkUrl();
-        } else {
-          // Case B: It's not Rich Text. Check if the raw value is a plain URL.
-          const rawValue = String(range.getValue() || '').trim();
-          if (rawValue.startsWith('http')) {
-            routeMapLink = rawValue;
-          }
-          // (Note: This intentionally ignores HYPERLINK formulas as they are complex to parse)
-        }
+      // Bold the next word after the modifier
+      const after = text.slice(modEnd);
+      const nextMatch = after.match(/^\s*([^\s,.;:!?()]+)/);
+      if (nextMatch) {
+        const nextWord = nextMatch[1];
+        const leading = nextMatch[0];
+        const wordStart = modEnd + (leading.length - nextWord.length);
+        const wordEnd = wordStart + nextWord.length;
+        ranges.push([wordStart, wordEnd]);
       }
     }
-    
-    // 3. Final label check: Use default if no link, or if label is just the raw link.
-    if (!routeMapLink) {
-      routeMapLabel = defaultLabel; // No link found, use default label
-    } else if (routeMapLink === routeMapLabel || !routeMapLabel) {
-      // If the label is just the raw link (Case B) or empty, use the cleaner default label.
-      routeMapLabel = defaultLabel;
-    }
-    // --- END: MODIFIED LINK/LABEL EXTRACTION ---
-
-
-    // Group stops by a unique identifier (Address + Name)
-    const personStops = routeRows.reduce((acc, row) => {
-      const address = String(row[addressColumnIndex]).trim();
-      const name = String(row[nameColumnIndex]).trim();
-      if (address) {
-        const key = address + "|" + name;
-        if (!acc[key]) acc[key] = [];
-        acc[key].push(row);
-      }
-      return acc;
-    }, {});
-
-    // Create the Route Sheet
-    const sheet = ss.insertSheet(`Route_${routeSafe}`);
-    sheet.clearFormats();
-    sheet.setTabColor(routeColor);
-
-    // --- START: CORRECTED HELPER FUNCTION CALL ---
-    // Call the helper function
-    this[helperFunction](
-      ss,
-      sheet,
-      route,
-      driver,
-      personStops,
-      itemMap,
-      finalItemHeaders,
-      headers,
-      routeColor,
-      routeColors,
-      {
-        nameCol: nameColumnIndex,
-        addressCol: addressColumnIndex,
-        phoneCol: phoneColumnIndex,
-        specCol: specReqsColumnIndex,
-        delivCol: delivInstrColumnIndex
-      },
-      routeMapLink,
-      routeMapLabel // <<< This argument was missing in your last version
-    );
-    // --- END: CORRECTED HELPER FUNCTION CALL ---
-
-
-    // Add to index
-    summary.push([
-      route,
-      driver,
-      Object.keys(personStops).length,
-      `=HYPERLINK("#gid=${sheet.getSheetId()}","Open")`
-    ]);
   });
 
-  // BUILD INDEX SHEET ("Driver_Deliveries")
-  indexSheet.getRange(1, 1, summary.length, summary[0].length).setValues(summary);
-  indexSheet.getRange("A1:D1")
-    .setFontWeight("bold")
-    .setBackground("#F0F0F0")
-    .setHorizontalAlignment("center");
+  if (ranges.length === 0) {
+    return builder.build();
+  }
 
-  indexSheet.autoResizeColumns(1, 4);
-  SpreadsheetApp.flush();
-  return timestamp;  
+  // 3) Merge overlapping/adjacent ranges
+  ranges.sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (let i = 0; i < ranges.length; i++) {
+    const [s, e] = ranges[i];
+    if (merged.length === 0 || s > merged[merged.length - 1][1]) {
+      merged.push([s, e]);
+    } else {
+      merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], e);
+    }
+  }
+
+  // 4) Apply the bold style
+  merged.forEach(([s, e]) => {
+    if (s >= 0 && e > s && e <= text.length) {
+      builder.setTextStyle(s, e, boldStyle);
+    }
+  });
+
+  return builder.build();
 }
+
+// end new packing list work
 
 function populateRouteTabs(ss, sheet, route, driver, personStops, itemMap, finalItemHeaders, sourceHeaders, routeColor, allStopColors, colIndices, routeMapLink, routeMapLabel) {
   const finalTableWidth = 1 + finalItemHeaders.length;
@@ -1647,7 +2061,7 @@ function formatKeywords(text) {
     return text;
   }
   
-  const keywords = ["gluten", "dairy", "vegan", "vegetarian", "allergy"];
+  const keywords = ["gluten", "dairy", "vegan", "vegetarian", "allergy", "nut", "tomato", "extra", "no", "soy", "non", "not"];
   // Red color code
   const RED_COLOR = "#FF0000"; 
   
@@ -1680,6 +2094,672 @@ function formatKeywords(text) {
   });
   
   return hasFormatting ? builder.build() : text;
+}
+
+function makeTheLabels() {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const dataSheet = ss.getSheetByName("Deliveries-UPDATE HERE");
+    const outputSheetName = "DeliveryLabels";
+    let outputSheet = ss.getSheetByName(outputSheetName);
+
+    const timestamp = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy/MM/dd HH:mm:ss");
+
+    // --- NEW: Calculate the desired insertion index and log details ---
+    let targetIndex;
+    
+    if (dataSheet) {
+        // Log the details of the source sheet
+        Logger.log(`Source Sheet ("${dataSheet.getName()}") Index: ${dataSheet.getIndex()}`);
+
+        // FIX: Insert the new sheet immediately AFTER the source data sheet.
+        // Sheets are 1-indexed. To place AFTER index N, we use N + 1.
+        targetIndex = dataSheet.getIndex() + 1; 
+        
+        // Log the calculated index
+        Logger.log(`Calculated Target Index (Insert AFTER data sheet): ${targetIndex}`);
+        
+        // If you wanted it at the very end, regardless of location, you would use:
+        // targetIndex = ss.getNumSheets(); 
+    } else {
+        // Fallback: Insert at the very end of the sheet list if the data sheet is not found.
+        targetIndex = ss.getNumSheets();
+        Logger.log(`Source sheet "Deliveries-UPDATE HERE" not found. Inserting at the end (Index: ${targetIndex}).`);
+    }
+    // ----------------------------------------------------
+
+    // Only insert the sheet if it doesn't already exist.
+    if (!outputSheet) {
+        // We now use the calculated targetIndex instead of the hardcoded 0.
+        outputSheet = ss.insertSheet(outputSheetName, targetIndex); 
+        Logger.log(`Output sheet created at index: ${outputSheet.getIndex()}`);
+    } else {
+        // If the sheet already exists, its position is not changed by this function
+        Logger.log(`Output sheet ("${outputSheetName}") found at index: ${outputSheet.getIndex()}. Position not changed.`);
+    }
+
+    // Completely clear previous content, formatting, filters
+    outputSheet.clear();
+    outputSheet.setFrozenRows(0);
+    outputSheet.setFrozenColumns(0);
+
+    const data = dataSheet.getDataRange().getValues();
+    const headers = data[0];
+    const dataRows = data.slice(1);
+
+    // --- 1. Identify Key Indices ---
+    const nameIdx = headers.indexOf("Name");
+    const routeIdx = headers.indexOf("routeDescription");
+    
+    // Locate the "Conf for" column (case-insensitive find)
+    const confForHeader = headers.find(h => typeof h === 'string' && h.trim().startsWith("Conf for"));
+    const confForIdx = confForHeader ? headers.indexOf(confForHeader) : -1;
+
+    // Indices for Bag Count Calculation
+    const diapers1Idx = headers.indexOf("diapers1(size)");
+    const diapers2Idx = headers.indexOf("diapers2(size)");
+    const diapers3Idx = headers.indexOf("diapers3(size)");
+    const wipesIdx = headers.indexOf("wipes(qty)");
+    const dogFoodIdx = headers.indexOf("dogFood(qty)");
+    const catFoodIdx = headers.indexOf("catFood(qty)");
+
+    // Safety check for required columns
+    if (nameIdx === -1 || routeIdx === -1 || confForIdx === -1) {
+        Logger.log("Missing essential columns (Name, routeDescription, or Conf for *). Cannot generate labels.");
+        SpreadsheetApp.getUi().alert("Missing essential columns (Name, routeDescription, or Conf for *). Cannot generate labels.");
+        return;
+    }
+
+    // --- 2. Build Route-Driver Mapping ---
+    const helperSheet = ss.getSheetByName("DeliveriesHelpTable");
+    const routeDriverMap = {};
+    if (helperSheet) {
+        const helperData = helperSheet.getDataRange().getValues().slice(1);
+        helperData.forEach(row => { 
+            const routeKey = String(row[0] || '').trim();
+            const driverValue = String(row[1] || '').trim();
+            if (routeKey) routeDriverMap[routeKey] = driverValue; 
+        });
+    }
+
+    // --- 3. Filter Data and Process Each Delivery Row ---
+    const deliveriesData = [];
+    const labelFontSizeMap = {}; // Maps the delivery index to font sizes
+    let deliveryIndexCounter = 0; // Counter for mapping purposes
+
+    const filteredDataRows = dataRows
+        // Filter by Conf for * = 'YES' or includes 'NO ANS'
+        .filter(row => {
+            const confValue = String(row[confForIdx] || '').toUpperCase().trim();
+            return confValue === 'YES' || confValue.includes('NO ANS');
+        });
+
+    filteredDataRows.forEach(row => {
+        const name = String(row[nameIdx] || 'UNKNOWN NAME');
+        const route = String(row[routeIdx] || 'UNKNOWN ROUTE').trim();
+        const driver = routeDriverMap[route] || "TBD";
+        
+        // Dynamic Font Size Emulation for Name
+        const baseNameFontSize = 12;
+        const reducedNameFontSize = 10;
+        const maxNameLength = 20; 
+        const nameFontSize = name.length > maxNameLength ? reducedNameFontSize : baseNameFontSize;
+
+        // Dynamic Font Size Emulation for Driver (USING USER'S CUSTOM VALUES)
+        const baseDriverFontSize = 13;
+        const reducedDriverFontSize = 11;
+        const maxDriverLength = 20;
+        const driverFontSize = driver.length > maxDriverLength ? reducedDriverFontSize : baseDriverFontSize;
+
+
+        // --- Bag Count Logic (Only counts bulky items) ---
+        let bagCount = 0;
+
+        // A. Diapers: 1 bag per non-empty column (max 3)
+        if (diapers1Idx !== -1 && String(row[diapers1Idx]).trim() !== "") bagCount++;
+        if (diapers2Idx !== -1 && String(row[diapers2Idx]).trim() !== "") bagCount++;
+        if (diapers3Idx !== -1 && String(row[diapers3Idx]).trim() !== "") bagCount++;
+
+        // B. Wipes: 1 bag per whole quantity
+        const wipesQty = parseFloat(row[wipesIdx] || 0) || 0;
+        bagCount += Math.ceil(wipesQty);
+        
+        // C. Pet Food: 1 bag per whole quantity
+        const dogFoodQty = parseFloat(row[dogFoodIdx] || 0) || 0;
+        const catFoodQty = parseFloat(row[catFoodIdx] || 0) || 0;
+        bagCount += Math.ceil(dogFoodQty) + Math.ceil(catFoodQty);
+        
+        // --- IMPLEMENT HARD LIMIT OF 3 LABELS ---
+        bagCount = Math.min(bagCount, 3);
+        
+        if (bagCount > 0) {
+             const delivery = {
+                Name: name,
+                Driver: driver,
+                TotalLabels: bagCount
+            };
+            
+            deliveriesData.push(delivery);
+            
+            // Store font size metadata keyed by the delivery index
+            labelFontSizeMap[deliveryIndexCounter] = { 
+                name: nameFontSize,
+                driver: driverFontSize
+            };
+            deliveryIndexCounter++;
+        }
+    });
+
+    // --- 4. Format Output into Grouped Delivery Layout (2 Rows per Delivery) ---
+    const finalOutput = [];
+    const labelsPerRow = 3;
+    const labelHeightRows = 2; // *** RESTORED: 2 rows per physical label ***
+    const labelWidthCols = 2;  
+    const totalCols = labelsPerRow * labelWidthCols; // 6 columns 
+    
+    // Store the delivery index corresponding to each new row pair for formatting later
+    const outputRowMapping = []; 
+
+    deliveriesData.forEach((delivery, index) => {
+        const row1Data = []; // Name and Bag Numbers
+        const row2Data = []; // Driver Names
+        
+        const numLabelsToGenerate = delivery.TotalLabels;
+
+        for (let j = 0; j < labelsPerRow; j++) {
+            if (j < numLabelsToGenerate) {
+                // Generate content for this label slot
+                const nameLine = `${delivery.Name}`;
+                const detailLine = `${delivery.Driver}`; // Driver Name Only
+                const numberLine = `BAG ${j + 1}/${delivery.TotalLabels}`;
+
+                // Row 1: Name and Bag Number
+                row1Data.push(nameLine, numberLine);
+                // Row 2: Driver Name (Pushed twice for merging later)
+                row2Data.push(detailLine, detailLine); 
+            } else {
+                // Leave the remaining slots blank
+                row1Data.push("", ""); 
+                row2Data.push("", ""); 
+            }
+        }
+        
+        finalOutput.push(row1Data, row2Data); // Push both rows for the delivery
+        // Store the index of the delivery
+        outputRowMapping.push(index);
+    });
+    
+    if (finalOutput.length === 0) {
+        SpreadsheetApp.getUi().alert("No confirmed deliveries with items found to generate labels.");
+        return;
+    }
+    
+    // --- 5. Write Data to Sheet ---
+    
+    outputSheet.getRange(1, 1, finalOutput.length, totalCols).setValues(finalOutput);
+
+    // --- 6. Formatting and Sizing for Avery 6240 (30-up) ---
+    
+    // Set column widths for printing (Columns A/B, C/D, E/F form the 3 labels)
+    //const width = 250;
+    const width = 258; 
+    outputSheet.setColumnWidth(1, width * 0.7); // Name/Route Line (70%)
+    outputSheet.setColumnWidth(2, width * 0.3); // Label Number (30%)
+    outputSheet.setColumnWidth(3, width * 0.7);
+    outputSheet.setColumnWidth(4, width * 0.3);
+    outputSheet.setColumnWidth(5, width * 0.7);
+    outputSheet.setColumnWidth(6, width * 0.3);
+    
+
+    // Loop through the output data rows (2 rows per delivery)
+    for (let r = 1; r <= finalOutput.length; r += labelHeightRows) { 
+        
+        // Calculate the index of the current delivery block in outputRowMapping
+        const deliveryIndex = outputRowMapping[(r - 1) / labelHeightRows];
+        const deliveryInfo = deliveriesData[deliveryIndex];
+        const numLabels = deliveryInfo.TotalLabels;
+
+        // *** RESTORED: Set both Row Heights to 36px (36px + 36px = 72px total label height) ***
+        //outputSheet.setRowHeight(r, 36); // Row 1 (Name/Number)
+        //outputSheet.setRowHeight(r + 1, 36); // Row 2 (Driver)
+        outputSheet.setRowHeight(r, 51.5); // Row 1 (Name/Number)
+        outputSheet.setRowHeight(r + 1, 51.5); // Row 2 (Driver)
+
+        // General Formatting for the Label Block (2 rows x 6 columns)
+        const labelBlock = outputSheet.getRange(r, 1, labelHeightRows, totalCols);
+
+        // Explicitly remove all borders (Top, Bottom, Left, Right, Vertical, Horizontal)
+        labelBlock.setBorder(false, false, false, false, false, false); 
+
+        // Align all content to the middle vertically
+        labelBlock.setFontWeight("bold").setVerticalAlignment("middle").setHorizontalAlignment("center");
+        
+        // --- Apply Dynamic Font Sizing for Names and Drivers ---
+
+        // Get the font sizing metadata for this delivery
+        const formatting = labelFontSizeMap[deliveryIndex];
+        const nameFontSize = formatting ? formatting.name : 12; 
+        const driverFontSize = formatting ? formatting.driver : 13; 
+
+        // Apply formatting across all generated labels in this row pair
+        for (let j = 0; j < numLabels; j++) {
+            const colNameStart = j * 2 + 1; // 1, 3, 5
+            const colBagStart = j * 2 + 2; // 2, 4, 6
+
+            // Row 2: Driver Name Merging (Must happen first)
+            outputSheet.getRange(r + 1, colNameStart, 1, 2).mergeAcross();
+            
+            // Row 1, Name Cell (Dynamic Font Size)
+            outputSheet.getRange(r, colNameStart, 1, 1)
+                .setFontSize(nameFontSize)
+                .setWrap(false)
+                .setFontColor("#000000") // Black color
+                .setHorizontalAlignment("center");
+            
+            // Row 1, Bag Number Cell (Fixed Font Size)
+            outputSheet.getRange(r, colBagStart, 1, 1)
+                .setFontSize(10)
+                .setFontWeight("normal")
+                .setHorizontalAlignment("left");
+
+            // Row 2, Driver Name Cell (Dynamic Font Size) - Applies to the merged range
+            outputSheet.getRange(r + 1, colNameStart, 1, 2)
+                .setFontSize(driverFontSize) // *** DYNAMIC FONT SIZE APPLIED HERE ***
+                .setFontColor("#3C78D8") // Blue color
+                .setHorizontalAlignment("center"); 
+        }
+    }
+
+    // --- Safely delete excess rows and columns ---
+    
+    const maxRows = outputSheet.getMaxRows();
+    const rowsToDelete = maxRows - finalOutput.length;
+    if (rowsToDelete > 0) {
+        outputSheet.deleteRows(finalOutput.length + 1, rowsToDelete);
+    }
+    
+    const maxCols = outputSheet.getMaxColumns();
+    const colsToDelete = maxCols - totalCols;
+    if (colsToDelete > 0) {
+        outputSheet.deleteColumns(totalCols + 1, colsToDelete);
+    }
+    
+    SpreadsheetApp.flush();
+
+    return timestamp;
+}
+
+
+// Updated function signature for clarity
+function generateDeliveryLabels(config = {}) {
+    const defaults = {
+        includeDriverNames: false // Default: Include driver names
+    };
+    const finalConfig = { ...defaults, ...config };
+    
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const dataSheet = ss.getSheetByName("Deliveries-UPDATE HERE");
+    const outputSheetName = "DeliveryLabels";
+
+    if (!dataSheet) {
+        SpreadsheetApp.getUi().alert("Source sheet 'Deliveries-UPDATE HERE' not found. Cannot generate labels.");
+        return;
+    }
+    
+    // 1. Setup/Initialization
+    const outputSheet = setupOutputSheet(ss, dataSheet, outputSheetName);
+    
+    // 2. Data Extraction and Pre-processing
+    const { headers, dataRows } = getSourceData(dataSheet);
+    const indices = getColumnIndices(headers);
+    if (!indices.isValid) {
+        SpreadsheetApp.getUi().alert("Missing essential columns (Name, routeDescription, or Conf for *). Cannot generate labels.");
+        return;
+    }
+    const routeDriverMap = getRouteDriverMap(ss);
+
+    // 3. Generate Individual Labels (New Flat Structure)
+    const { allLabels, labelFontSizeMap } = generateAllIndividualLabels(dataRows, indices, routeDriverMap);
+
+    if (allLabels.length === 0) {
+        SpreadsheetApp.getUi().alert("No confirmed deliveries with items found to generate labels.");
+        return;
+    }
+
+    // 4. Format Output into Continuous Matrix
+    const { finalOutput, outputLabelMapping } = formatContinuousLabelData(allLabels, finalConfig.includeDriverNames);
+    
+    // 5. Write Data and Apply Formatting
+    writeAndFormatContinuousLabels(outputSheet, finalOutput, outputLabelMapping, allLabels, labelFontSizeMap, finalConfig);
+    
+    SpreadsheetApp.flush();
+    return Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy/MM/dd HH:mm:ss");
+}
+
+// --- Wrapper functions for easy use from the menu ---
+
+function generateWithDrivers() {
+    // Adding 'return' ensures the timestamp reaches makeLabelsPDF
+    return generateDeliveryLabels({ includeDriverNames: true });
+}
+
+function generateWithoutDrivers() {
+    // Adding 'return' ensures the timestamp reaches makeLabelsPDF
+    return generateDeliveryLabels({ includeDriverNames: false });
+}
+// --- Constants for Label Dimensions (Avery 6240) ---
+const LABELS_PER_ROW = 3;
+const LABEL_HEIGHT_ROWS = 2; // 2 rows of Google Sheets = 1 physical label
+const LABEL_WIDTH_COLS = 2;
+const TOTAL_COLS = LABELS_PER_ROW * LABEL_WIDTH_COLS; // 6 columns total
+
+// (setupOutputSheet, getSourceData, getColumnIndices, getRouteDriverMap, calculateBagCount remain the same)
+
+/**
+ * Handles sheet creation/retrieval and clearing.
+ */
+function setupOutputSheet(ss, dataSheet, outputSheetName) {
+    let outputSheet = ss.getSheetByName(outputSheetName);
+    
+    // Calculate the target index to place the new sheet after the data sheet
+    const targetIndex = dataSheet.getIndex() + 1; 
+
+    if (!outputSheet) {
+        outputSheet = ss.insertSheet(outputSheetName, targetIndex); 
+    }
+    
+    // Clear and reset the sheet
+    outputSheet.clear();
+    outputSheet.setFrozenRows(0);
+    outputSheet.setFrozenColumns(0);
+    
+    return outputSheet;
+}
+
+/**
+ * Gets all values from the data sheet, excluding headers.
+ */
+function getSourceData(dataSheet) {
+    const data = dataSheet.getDataRange().getValues();
+    return {
+        headers: data[0],
+        dataRows: data.slice(1)
+    };
+}
+
+/**
+ * Finds and returns all necessary column indices.
+ */
+function getColumnIndices(headers) {
+    const indices = {};
+    indices.nameIdx = headers.indexOf("Name");
+    indices.routeIdx = headers.indexOf("routeDescription");
+    
+    // Locate the "Conf for" column (case-insensitive find)
+    const confForHeader = headers.find(h => typeof h === 'string' && h.trim().startsWith("Conf for"));
+    indices.confForIdx = confForHeader ? headers.indexOf(confForHeader) : -1;
+
+    // Indices for Bag Count Calculation
+    indices.diapers1Idx = headers.indexOf("diapers1(size)");
+    indices.diapers2Idx = headers.indexOf("diapers2(size)");
+    indices.diapers3Idx = headers.indexOf("diapers3(size)");
+    indices.wipesIdx = headers.indexOf("wipes(qty)");
+    indices.dogFoodIdx = headers.indexOf("dogFood(qty)");
+    indices.catFoodIdx = headers.indexOf("catFood(qty)");
+    
+    indices.isValid = indices.nameIdx !== -1 && indices.routeIdx !== -1 && indices.confForIdx !== -1;
+    
+    return indices;
+}
+
+/**
+ * Builds a map of route to driver from the helper sheet.
+ */
+function getRouteDriverMap(ss) {
+    const helperSheet = ss.getSheetByName("DeliveriesHelpTable");
+    const routeDriverMap = {};
+    if (helperSheet) {
+        const helperData = helperSheet.getDataRange().getValues().slice(1);
+        helperData.forEach(row => { 
+            const routeKey = String(row[0] || '').trim();
+            const driverValue = String(row[1] || '').trim();
+            if (routeKey) routeDriverMap[routeKey] = driverValue; 
+        });
+    }
+    return routeDriverMap;
+}
+
+/**
+ * Calculates the number of bags needed for a single delivery row.
+ */
+function calculateBagCount(row, indices) {
+    let bagCount = 0;
+    const MAX_LABELS = 3;
+    
+    // A. Diapers: 1 bag per non-empty column (max 3)
+    if (indices.diapers1Idx !== -1 && String(row[indices.diapers1Idx]).trim() !== "") bagCount++;
+    if (indices.diapers2Idx !== -1 && String(row[indices.diapers2Idx]).trim() !== "") bagCount++;
+    if (indices.diapers3Idx !== -1 && String(row[indices.diapers3Idx]).trim() !== "") bagCount++;
+
+    // B. Wipes: 1 bag per whole quantity (Math.ceil handles decimal quantities)
+    const wipesQty = parseFloat(row[indices.wipesIdx] || 0) || 0;
+    bagCount += Math.ceil(wipesQty);
+    
+    // C. Pet Food: 1 bag per whole quantity
+    const dogFoodQty = parseFloat(row[indices.dogFoodIdx] || 0) || 0;
+    const catFoodQty = parseFloat(row[indices.catFoodIdx] || 0) || 0;
+    bagCount += Math.ceil(dogFoodQty) + Math.ceil(catFoodQty);
+    
+    // Enforce hard limit
+    return Math.min(bagCount, MAX_LABELS);
+}
+
+
+
+/**
+ * NEW: Processes deliveries and generates a flat array of required individual labels.
+ */
+function generateAllIndividualLabels(dataRows, indices, routeDriverMap) {
+    const allLabels = [];
+    // Stores formatting keyed by the sequential index of the delivery the label belongs to.
+    const labelFontSizeMap = {}; 
+    let deliveryIndexCounter = 0;
+
+    const filteredDataRows = dataRows
+        .filter(row => {
+            const confValue = String(row[indices.confForIdx] || '').toUpperCase().trim();
+            return confValue === 'YES' || confValue.includes('NO ANS');
+        });
+
+    filteredDataRows.forEach(row => {
+        const name = String(row[indices.nameIdx] || 'UNKNOWN NAME');
+        const route = String(row[indices.routeIdx] || 'UNKNOWN ROUTE').trim();
+        const driver = routeDriverMap[route] || "TBD";
+        const totalLabels = calculateBagCount(row, indices);
+        
+        if (totalLabels > 0) {
+            // Determine Font Sizes
+            const baseNameFontSize = 12;
+            const reducedNameFontSize = 10;
+            const maxNameLength = 20; 
+            const nameFontSize = name.length > maxNameLength ? reducedNameFontSize : baseNameFontSize;
+            
+            const baseDriverFontSize = 13;
+            const reducedDriverFontSize = 11;
+            const maxDriverLength = 20;
+            const driverFontSize = driver.length > maxDriverLength ? reducedDriverFontSize : baseDriverFontSize;
+
+            // Generate an entry for *each* required label
+            for (let i = 1; i <= totalLabels; i++) {
+                allLabels.push({
+                    Name: name,
+                    Driver: driver,
+                    BagNumber: i,
+                    TotalLabels: totalLabels,
+                    DeliveryIndex: deliveryIndexCounter // Reference for formatting map
+                });
+            }
+
+            // Store font size metadata keyed by the delivery index
+            labelFontSizeMap[deliveryIndexCounter] = { 
+                name: nameFontSize,
+                driver: driverFontSize
+            };
+            deliveryIndexCounter++;
+        }
+    });
+
+    return { allLabels, labelFontSizeMap };
+}
+
+/**
+ * NEW: Formats the flat list of labels into the final continuous 2D array.
+ */
+function formatContinuousLabelData(allLabels, includeDriverNames) {
+    const finalOutput = [];
+    // outputLabelMapping maps each ROW pair index to the DeliveryIndex for formatting lookups
+    const outputLabelMapping = []; 
+    
+    // Calculate the total number of physical label slots needed (rounded up to the nearest row of 3)
+    const totalLabelSlots = Math.ceil(allLabels.length / LABELS_PER_ROW) * LABELS_PER_ROW;
+    
+    // We iterate through the required total slots, 3 at a time (one row)
+    for (let i = 0; i < totalLabelSlots; i += LABELS_PER_ROW) {
+        const row1Data = []; // Name and Bag Numbers
+        const row2Data = []; // Driver Names / Empty Line
+        
+        // This array will hold the DeliveryIndex of the *first* label in this row of 3
+        let rowDeliveryIndex = -1; 
+        
+        // Populate the 3 label slots (6 columns) for this row
+        for (let j = 0; j < LABELS_PER_ROW; j++) {
+            const labelIndex = i + j; // Index in the flat allLabels array
+
+            if (labelIndex < allLabels.length) {
+                // This slot has a label
+                const label = allLabels[labelIndex];
+                
+                // Record the delivery index for this row pair's formatting lookup
+                if (j === 0) {
+                    rowDeliveryIndex = label.DeliveryIndex;
+                }
+
+                const nameLine = label.Name;
+                const numberLine = `BAG ${label.BagNumber}/${label.TotalLabels}`;
+                
+                row1Data.push(nameLine, numberLine);
+                
+                // --- FEATURE 1: Include Driver Names ---
+                let detailLine = "";
+                if (includeDriverNames) {
+                    detailLine = label.Driver;
+                }
+                // Row 2: Driver Name (or empty string) - Pushed twice for merging later
+                row2Data.push(detailLine, detailLine); 
+            } else {
+                // This slot is filler (empty)
+                row1Data.push("", ""); 
+                row2Data.push("", ""); 
+            }
+        }
+        
+        finalOutput.push(row1Data, row2Data);
+        outputLabelMapping.push(rowDeliveryIndex); 
+    }
+    
+    return { finalOutput, outputLabelMapping };
+}
+
+/**
+ * NEW: Writes the data to the sheet and applies all required formatting for the continuous layout.
+ */
+function writeAndFormatContinuousLabels(outputSheet, finalOutput, outputLabelMapping, allLabels, labelFontSizeMap, config) {
+    
+    // 1. Write Data to Sheet
+    outputSheet.getRange(1, 1, finalOutput.length, TOTAL_COLS).setValues(finalOutput);
+
+    // 2. Set column widths (same as before)
+    const width = 258; 
+    outputSheet.setColumnWidth(1, width * 0.7); 
+    outputSheet.setColumnWidth(2, width * 0.3);
+    outputSheet.setColumnWidth(3, width * 0.7);
+    outputSheet.setColumnWidth(4, width * 0.3);
+    outputSheet.setColumnWidth(5, width * 0.7);
+    outputSheet.setColumnWidth(6, width * 0.3);
+    
+    let labelCounter = 0; // Tracks the index in the flat 'allLabels' array
+    
+    // 3. Loop through the output data rows (2 rows per physical label row)
+    for (let r = 1; r <= finalOutput.length; r += LABEL_HEIGHT_ROWS) { 
+        
+        // Set row heights
+        outputSheet.setRowHeight(r, 51.5); 
+        outputSheet.setRowHeight(r + 1, 51.5); 
+
+        // General Formatting for the Label Block (2 rows x 6 columns)
+        const labelBlock = outputSheet.getRange(r, 1, LABEL_HEIGHT_ROWS, TOTAL_COLS);
+        labelBlock.setBorder(false, false, false, false, false, false); 
+        labelBlock.setFontWeight("bold").setVerticalAlignment("middle").setHorizontalAlignment("center");
+
+        // Apply formatting across the 3 label slots in this row pair
+        for (let j = 0; j < LABELS_PER_ROW; j++) {
+            const colNameStart = j * 2 + 1; // 1, 3, 5
+            const colBagStart = j * 2 + 2; // 2, 4, 6
+            
+            // Check if this slot contains an actual label (not empty filler)
+            if (labelCounter < allLabels.length) {
+                const currentLabel = allLabels[labelCounter];
+                
+                // Get the formatting based on the delivery index stored in the flat label
+                const formatting = labelFontSizeMap[currentLabel.DeliveryIndex];
+                const nameFontSize = formatting ? formatting.name : 12; 
+                const driverFontSize = formatting ? formatting.driver : 13; 
+
+                // Row 2: Driver Name Merging (Must happen for visual appearance if drivers are included)
+                if (config.includeDriverNames) {
+                    outputSheet.getRange(r + 1, colNameStart, 1, 2).mergeAcross();
+                }
+                
+                // Row 1, Name Cell (Dynamic Font Size)
+                outputSheet.getRange(r, colNameStart, 1, 1)
+                    .setFontSize(nameFontSize)
+                    .setWrap(false)
+                    .setFontColor("#000000")
+                    .setHorizontalAlignment("center");
+                
+                // Row 1, Bag Number Cell (Fixed Font Size)
+                outputSheet.getRange(r, colBagStart, 1, 1)
+                    .setFontSize(10)
+                    .setFontWeight("normal")
+                    .setHorizontalAlignment("left");
+
+                // Row 2, Driver Name Cell 
+                // We format a 2-column range (merged or not) for consistency
+                const driverRange = outputSheet.getRange(r + 1, colNameStart, 1, 2); 
+                driverRange
+                    .setFontSize(driverFontSize) 
+                    .setFontColor(config.includeDriverNames ? "#3C78D8" : "#000000")
+                    .setHorizontalAlignment("center"); 
+                
+                labelCounter++;
+            } else {
+                // Slot is empty filler (no specific formatting needed, general block formatting applies)
+                labelCounter++; // Still need to advance the counter to properly stop the loop
+            }
+        }
+    }
+    
+    // 4. Safely delete excess rows and columns
+    const maxRows = outputSheet.getMaxRows();
+    const rowsToDelete = maxRows - finalOutput.length;
+    if (rowsToDelete > 0) {
+        outputSheet.deleteRows(finalOutput.length + 1, rowsToDelete);
+    }
+    
+    const maxCols = outputSheet.getMaxColumns();
+    const colsToDelete = maxCols - TOTAL_COLS;
+    if (colsToDelete > 0) {
+        outputSheet.deleteColumns(TOTAL_COLS + 1, colsToDelete);
+    }
 }
 
 function makeDriverRouteTabsThenPDF() {
@@ -1764,11 +2844,12 @@ function makeDriverRouteTabsThenPDF() {
     Logger.log("makeDriverRouteTabsThenPDF finished.");
 }
 
-function makeSpecialItemsPDF() {
+function makePackingListThenPDF() {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     
     // 1. CAPTURE THE TIMESTAMP from the first function
-    const timestamp = generateSpecialItemsCoordinator(); 
+    //const timestamp = generateSpecialItemsCoordinator();
+    const timestamp = makePackingLists(); 
     
     if (timestamp === "ERROR_NO_SHEET") return; // Exit if sheet was not found
 
@@ -1777,11 +2858,11 @@ function makeSpecialItemsPDF() {
     // 2. SANITIZE & CONSTRUCT FILENAME
     // Remove characters from the timestamp that are illegal or problematic in file paths (like ':', '/')
     const sanitizedTimestamp = timestamp.replace(/[\/:]/g, '-').replace(/\s/g, '_');
-    const filename = `Special_Items_Packing_List_${sanitizedTimestamp}.pdf`;
+    const filename = `Packing_Lists_${sanitizedTimestamp}.pdf`;
 
-    const sheet = ss.getSheetByName("SpecialItemsCoordinator");
+    const sheet = ss.getSheetByName("PackingLists");
     if (!sheet) {
-      SpreadsheetApp.getUi().alert("Error: 'SpecialItemsCoordinator' sheet not found for PDF export.");
+      SpreadsheetApp.getUi().alert("Error: 'PackingLists' sheet not found for PDF export.");
       return;
     }
 
@@ -1833,9 +2914,18 @@ function makeLabelsPDF() {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     
     // 1. CAPTURE THE TIMESTAMP from the first function
-    const timestamp = makeTheLabels(); 
+    //const timestamp = makeTheLabels();
+    //const timestamp = generateDeliveryLabels();
+    const timestamp = generateWithoutDrivers();
+    //const timestamp = generateWithDrivers();
     
-    if (timestamp === "ERROR_NO_SHEET") return; // Exit if sheet was not found
+     
+    
+    // In makeLabelsPDF, change your check to this:
+    if (!timestamp || timestamp === "ERROR_NO_SHEET") {
+      console.log("PDF generation cancelled: No timestamp returned.");
+      return; 
+    }
 
     SpreadsheetApp.flush(); // Ensure all sheet changes are committed before PDF generation
     
@@ -1896,7 +2986,7 @@ function makeLabelsPDF() {
 
 function makeAllPDFs() {
   makeDriverRouteTabsThenPDF();
-  makeSpecialItemsPDF();
+  makePackingListThenPDF();
   makeLabelsPDF();
   SpreadsheetApp.getUi().alert('🎉 All 3 PDFs generated successfully!');
 }
@@ -1959,18 +3049,22 @@ function clearMapFilter() {
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu("📦 Distribution Day Tasks")
-    .addItem("1. Filter Data for Map (Col I)", "filterForMapCreation") // <-- NEW
-    .addItem("2. Clear Map Data Filter", "clearMapFilter")           // <-- NEW  
+    .addItem("1. Filter Data for Map (Col I)", "filterForMapCreation")
+    .addItem("2. Clear Map Data Filter", "clearMapFilter")
     .addSeparator() 
     .addItem("3. Make/Update Driver Route Tabs", "makeDriverRouteTabs")
-    .addItem("4. Make/Update Special Items Tab", "generateSpecialItemsCoordinator")
-    .addItem("5. Make/Update Printable Special Items Labels Tab", "makeTheLabels")
+    .addItem("4. Make/Update Packing Lists Tab", "makePackingLists")
+    .addItem("5. Make/Update Printable Packing Labels Tab", "makeTheLabels")
     .addSeparator()
     .addItem("6. Make Driver Route Tabs then the PDF", "makeDriverRouteTabsThenPDF")
-    .addItem("7. Make Special Items Tab then PDF", "makeSpecialItemsPDF")
-    .addItem("8. Make Printable Special Items Labels Tab then PDF", "makeLabelsPDF") 
+    .addItem("7. Make Packing Lists Tab then PDF", "makePackingListThenPDF")
+    .addItem("8. Make Printable Packing Labels Tab then PDF", "makeLabelsPDF") 
     .addSeparator()
     .addItem("9. Make All PDFs (Click OK on all 4 pop up messages)", "makeAllPDFs")
+    .addToUi();
+  ui.createMenu('📦 Label Generator')
+      .addItem('Generate Labels (w/ Drivers, Continuous)', 'generateWithDrivers')
+      .addItem('Generate Labels (w/o Drivers, Continuous)', 'generateWithoutDrivers')
     .addToUi();
   ui.createMenu("📦 Sheet Tools")
     .addItem('Delete Route Sheets', 'deleteSheetsByPrefix')
