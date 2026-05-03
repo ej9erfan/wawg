@@ -2096,65 +2096,313 @@ function formatKeywords(text) {
   return hasFormatting ? builder.build() : text;
 }
 
-function makeTheLabels() {
+function abbreviateRoute(route) {
+  if (!route || route === "UNKNOWN ROUTE") return "No Route";
+  const styleMap = {
+    "Chula Vista": "CV", "Encanto/Lemon Grove": "Enc/LG",
+    "Mountain View/National City": "MtV/NC", "Grantville/College East": "Gv/CE",
+    "Lake Murray/La Mesa": "LkM/LM", "Walking Delivery": "Walking",
+    "Logan Heights": "Logan Hts", "North Coast": "N. Coast"
+  };
+  let shortened = route;
+  for (let [full, short] of Object.entries(styleMap)) {
+    if (shortened.includes(full)) shortened = shortened.replace(full, short);
+  }
+  return shortened.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * DIAGNOSTIC TOOL: 
+ * Run this to see exactly what the script is "seeing" for Row 2 
+ * before any grid logic or merging happens.
+ */
+function debugRow2Contents(config = {}) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dataSheet = ss.getSheetByName("Deliveries-UPDATE HERE");
+  const debugSheetName = "DEBUG_Row2_Contents";
+  
+  // 1. Setup or Clear the Debug Tab
+  let debugSheet = ss.getSheetByName(debugSheetName);
+  if (!debugSheet) {
+    debugSheet = ss.insertSheet(debugSheetName);
+  }
+  debugSheet.clear().appendRow(["Recipient Name", "Selected Row 2 Content", "Mode Used"]);
+
+  if (!dataSheet) return;
+
+  const data = dataSheet.getDataRange().getValues();
+  const headers = data[0];
+  const dataRows = data.slice(1);
+
+  // 2. Map Indices and Helpers
+  const nameIdx = headers.indexOf("Name");
+  const routeIdx = headers.indexOf("routeDescription");
+  const confForIdx = headers.findIndex(h => h.toString().startsWith("Conf for"));
+  
+  const routeDriverMap = {};
+  const helperSheet = ss.getSheetByName("DeliveriesHelpTable");
+  if (helperSheet) {
+    helperSheet.getDataRange().getValues().slice(1).forEach(row => {
+      if (row[0]) routeDriverMap[String(row[0]).trim()] = String(row[1] || 'TBD').trim();
+    });
+  }
+
+  const debugLog = [];
+  const modeLabel = config.includeDriverNames ? "Driver" : 
+                    config.includeRouteNames ? "Route" : 
+                    config.includeAbbreviatedRouteNames ? "Abbrev" : "None";
+
+  // 3. Process the data exactly like the label maker does
+  dataRows.filter(row => {
+    const confValue = String(row[confForIdx] || '').toUpperCase();
+    return confValue === 'YES' || confValue.includes('NO ANS');
+  }).forEach(row => {
+    const name = String(row[nameIdx] || 'UNKNOWN');
+    const fullRoute = String(row[routeIdx] || 'UNKNOWN ROUTE').trim();
+    const driverName = routeDriverMap[fullRoute] || "TBD";
+    const abbrevRoute = abbreviateRoute(fullRoute);
+
+    // THE DECISION POINT (Same logic as the label generator)
+    let selection = "";
+    if (config.includeDriverNames) selection = driverName;
+    else if (config.includeRouteNames) selection = fullRoute;
+    else if (config.includeAbbreviatedRouteNames) selection = abbrevRoute;
+
+    debugLog.push([name, selection, modeLabel]);
+  });
+
+  // 4. Output to Column A (and B for reference)
+  if (debugLog.length > 0) {
+    debugSheet.getRange(2, 1, debugLog.length, 3).setValues(debugLog);
+    debugSheet.autoResizeColumns(1, 3);
+    SpreadsheetApp.getUi().alert(`Debug Complete. Check the "${debugSheetName}" tab.`);
+  } else {
+    SpreadsheetApp.getUi().alert("No confirmed deliveries found during debug.");
+  }
+}
+
+/**
+ * ULTRA-FAST DIAGNOSTIC
+ * This bypasses all formatting to avoid the 6-minute timeout.
+ * It outputs only the Row 2 content for every delivery to a new tab.
+ */
+function fastDebugRow2() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dataSheet = ss.getSheetByName("Deliveries-UPDATE HERE");
+  const helperSheet = ss.getSheetByName("DeliveriesHelpTable");
+  const debugSheetName = "DEBUG_RESULTS";
+  
+  // 1. Setup Sheet
+  let debugSheet = ss.getSheetByName(debugSheetName) || ss.insertSheet(debugSheetName);
+  debugSheet.clear();
+
+  // 2. Load ALL Data into Memory at once (Crucial for speed)
+  const data = dataSheet.getDataRange().getValues();
+  const headers = data[0];
+  const nameIdx = headers.indexOf("Name");
+  const routeIdx = headers.indexOf("routeDescription");
+  const confForIdx = headers.findIndex(h => h.toString().startsWith("Conf for"));
+
+  const routeDriverMap = {};
+  if (helperSheet) {
+    const helperData = helperSheet.getDataRange().getValues();
+    for (let i = 1; i < helperData.length; i++) {
+      if (helperData[i][0]) routeDriverMap[String(helperData[i][0]).trim()] = helperData[i][1];
+    }
+  }
+
+  // 3. Process Logic
+  const outputValues = [["RECIPIENT", "ROW 2 CONTENT (ABBREVIATED)"]];
+  
+  data.slice(1).forEach(row => {
+    const confValue = String(row[confForIdx] || '').toUpperCase();
+    if (confValue === 'YES' || confValue.includes('NO ANS')) {
+      const name = row[nameIdx];
+      const fullRoute = String(row[routeIdx] || '').trim();
+      
+      // We are testing the abbreviation specifically here
+      const result = abbreviateRoute(fullRoute); 
+      
+      outputValues.push([name, result]);
+    }
+  });
+
+  // 4. One single write operation (Fast!)
+  if (outputValues.length > 0) {
+    debugSheet.getRange(1, 1, outputValues.length, 2).setValues(outputValues);
+    SpreadsheetApp.getUi().alert("Done! Check the DEBUG_RESULTS tab.");
+  }
+}
+
+// --- Menu Wrappers for Debugging ---
+function debugDrivers() { debugRow2Contents({ includeDriverNames: true }); }
+function debugRoutes() { debugRow2Contents({ includeRouteNames: true }); }
+function debugAbbrev() { debugRow2Contents({ includeAbbreviatedRouteNames: true }); }
+function debugNull() { debugRow2Contents }
+
+function generateDeliveryLabels(config = {}) {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const dataSheet = ss.getSheetByName("Deliveries-UPDATE HERE");
     const outputSheetName = "DeliveryLabels";
     let outputSheet = ss.getSheetByName(outputSheetName);
 
-    const timestamp = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy/MM/dd HH:mm:ss");
-
-    // --- NEW: Calculate the desired insertion index and log details ---
-    let targetIndex;
-    
-    if (dataSheet) {
-        // Log the details of the source sheet
-        Logger.log(`Source Sheet ("${dataSheet.getName()}") Index: ${dataSheet.getIndex()}`);
-
-        // FIX: Insert the new sheet immediately AFTER the source data sheet.
-        // Sheets are 1-indexed. To place AFTER index N, we use N + 1.
-        targetIndex = dataSheet.getIndex() + 1; 
-        
-        // Log the calculated index
-        Logger.log(`Calculated Target Index (Insert AFTER data sheet): ${targetIndex}`);
-        
-        // If you wanted it at the very end, regardless of location, you would use:
-        // targetIndex = ss.getNumSheets(); 
-    } else {
-        // Fallback: Insert at the very end of the sheet list if the data sheet is not found.
-        targetIndex = ss.getNumSheets();
-        Logger.log(`Source sheet "Deliveries-UPDATE HERE" not found. Inserting at the end (Index: ${targetIndex}).`);
-    }
-    // ----------------------------------------------------
-
-    // Only insert the sheet if it doesn't already exist.
+    // 1. Setup Sheet (Preserving your specific index/clear logic)
+    if (!dataSheet) return;
     if (!outputSheet) {
-        // We now use the calculated targetIndex instead of the hardcoded 0.
-        outputSheet = ss.insertSheet(outputSheetName, targetIndex); 
-        Logger.log(`Output sheet created at index: ${outputSheet.getIndex()}`);
-    } else {
-        // If the sheet already exists, its position is not changed by this function
-        Logger.log(`Output sheet ("${outputSheetName}") found at index: ${outputSheet.getIndex()}. Position not changed.`);
+        outputSheet = ss.insertSheet(outputSheetName, dataSheet.getIndex() + 1);
     }
-
-    // Completely clear previous content, formatting, filters
     outputSheet.clear();
-    outputSheet.setFrozenRows(0);
-    outputSheet.setFrozenColumns(0);
 
     const data = dataSheet.getDataRange().getValues();
     const headers = data[0];
     const dataRows = data.slice(1);
 
-    // --- 1. Identify Key Indices ---
+    // 2. Map All Indices and Helpers Upfront
     const nameIdx = headers.indexOf("Name");
     const routeIdx = headers.indexOf("routeDescription");
+    const confForIdx = headers.findIndex(h => h.toString().startsWith("Conf for"));
     
-    // Locate the "Conf for" column (case-insensitive find)
+    // Mapping for Row 2 Data (Driver Info)
+    const routeDriverMap = {};
+    const helperSheet = ss.getSheetByName("DeliveriesHelpTable");
+    if (helperSheet) {
+        helperSheet.getDataRange().getValues().slice(1).forEach(row => {
+            if (row[0]) routeDriverMap[String(row[0]).trim()] = String(row[1] || 'TBD').trim();
+        });
+    }
+
+    const finalOutput = [];
+    const labelFormatting = [];
+
+    // 3. Filter and Build Content
+    dataRows.filter(row => {
+        const confValue = String(row[confForIdx] || '').toUpperCase();
+        return confValue === 'YES' || confValue.includes('NO ANS');
+    }).forEach(row => {
+        // --- DATA GATHERING (The "Decision Point" Preparation) ---
+        const name = String(row[nameIdx] || 'UNKNOWN');
+        const fullRoute = String(row[routeIdx] || 'UNKNOWN ROUTE').trim();
+        const driverName = routeDriverMap[fullRoute] || "TBD";
+        const abbrevRoute = abbreviateRoute(fullRoute); // Your helper function
+
+        // Determine Bag Count (Keeping your logic)
+        let bagCount = calculateBagCount(row, headers); // Helper used to keep this clean
+        bagCount = Math.min(bagCount, 3);
+
+        if (bagCount > 0) {
+            const row1Data = [];
+            const row2Data = [];
+
+            for (let j = 0; j < 3; j++) { // Avery 6240: 3 Labels per Row
+                if (j < bagCount) {
+                    // ROW 1: Constant Name | Bag Info
+                    row1Data.push(name, `BAG ${j + 1} of ${bagCount}`);
+
+                    // ROW 2: The Unified Decision Point
+                    let selection = "";
+                    if (config.includeDriverNames) selection = driverName;
+                    else if (config.includeRouteNames) selection = fullRoute;
+                    else if (config.includeAbbreviatedRouteNames) selection = abbrevRoute;
+
+                    row2Data.push(selection, ""); // Push to Col 1, Col 2 is empty for merge
+                } else {
+                    row1Data.push("", "");
+                    row2Data.push("", "");
+                }
+            }
+            finalOutput.push(row1Data, row2Data);
+            
+            // Store specific fonts based on the data we just pulled
+            labelFormatting.push({
+                nameSize: name.length > 20 ? 10 : 12,
+                detailSize: driverName.length > 20 ? 11 : 13 
+            });
+        }
+    });
+
+    // 4. Write and Format (Using your exact dimensions)
+    if (finalOutput.length > 0) {
+        outputSheet.getRange(1, 1, finalOutput.length, 6).setValues(finalOutput);
+        
+        // This function holds your "painstakingly worked out" dimensions
+        applyStrictGridFormatting(outputSheet, finalOutput.length, labelFormatting);
+    }
+}
+
+/**
+ * Avery 6240 dimensions
+ */
+function applyStrictGridFormatting(sheet, totalRows, formatting) {
+    const width = 258;
+    // Set widths: 70% for info, 30% for bag number
+    [1, 3, 5].forEach(c => sheet.setColumnWidth(c, width * 0.7));
+    [2, 4, 6].forEach(c => sheet.setColumnWidth(c, width * 0.3));
+
+    for (let r = 1; r <= totalRows; r += 2) {
+        sheet.setRowHeight(r, 51.5);
+        sheet.setRowHeight(r + 1, 51.5);
+        
+        const fmt = formatting[(r - 1) / 2];
+
+        for (let c = 1; c <= 5; c += 2) {
+            // Row 1 Style
+            sheet.getRange(r, c).setFontSize(fmt.nameSize).setFontWeight("bold");
+            sheet.getRange(r, c+1).setFontSize(10).setHorizontalAlignment("right");
+
+            // Row 2 Style
+            const row2Range = sheet.getRange(r + 1, c, 1, 2);
+            if (!row2Range.isPartOfMerge()) row2Range.mergeAcross();
+            row2Range.setFontSize(fmt.detailSize)
+                     .setFontColor("#3C78D8")
+                     .setHorizontalAlignment("center");
+        }
+    }
+}
+
+// Menu Wrappers
+function generateWithoutDrivers() { generateDeliveryLabels({}); }
+function generateWithDrivers() { generateDeliveryLabels({ includeDriverNames: true }); }
+function generateWithRoutes() { generateDeliveryLabels({ includeRouteNames: true }); }
+function generateWithAbbreviatedRoutes() { generateDeliveryLabels({ includeAbbreviatedRouteNames: true }); }
+
+/**
+ * Core logic to build the label content based on user requirements.
+ * This respects the 2-row-per-label grid.
+ */
+function generateDeliveryLabels(config = {}) {
+    const defaults = {
+        includeDriverNames: false,
+        includeRouteNames: false,
+        includeAbbreviatedRouteNames: false
+    };
+    const finalConfig = { ...defaults, ...config };
+    
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const dataSheet = ss.getSheetByName("Deliveries-UPDATE HERE");
+    const outputSheetName = "DeliveryLabels";
+    let outputSheet = ss.getSheetByName(outputSheetName);
+
+    if (!dataSheet) {
+        SpreadsheetApp.getUi().alert("Source sheet 'Deliveries-UPDATE HERE' not found.");
+        return;
+    }
+
+    // 1. Setup Sheet (Keep your index logic)
+    if (!outputSheet) {
+        outputSheet = ss.insertSheet(outputSheetName, dataSheet.getIndex() + 1);
+    }
+    outputSheet.clear();
+
+    // 2. Get Data & Indices
+    const data = dataSheet.getDataRange().getValues();
+    const headers = data[0];
+    const dataRows = data.slice(1);
+    const nameIdx = headers.indexOf("Name");
+    const routeIdx = headers.indexOf("routeDescription");
     const confForHeader = headers.find(h => typeof h === 'string' && h.trim().startsWith("Conf for"));
     const confForIdx = confForHeader ? headers.indexOf(confForHeader) : -1;
 
-    // Indices for Bag Count Calculation
+    // Bag Count Indices
     const diapers1Idx = headers.indexOf("diapers1(size)");
     const diapers2Idx = headers.indexOf("diapers2(size)");
     const diapers3Idx = headers.indexOf("diapers3(size)");
@@ -2162,237 +2410,122 @@ function makeTheLabels() {
     const dogFoodIdx = headers.indexOf("dogFood(qty)");
     const catFoodIdx = headers.indexOf("catFood(qty)");
 
-    // Safety check for required columns
-    if (nameIdx === -1 || routeIdx === -1 || confForIdx === -1) {
-        Logger.log("Missing essential columns (Name, routeDescription, or Conf for *). Cannot generate labels.");
-        SpreadsheetApp.getUi().alert("Missing essential columns (Name, routeDescription, or Conf for *). Cannot generate labels.");
-        return;
-    }
-
-    // --- 2. Build Route-Driver Mapping ---
+    // 3. Build Route-Driver Map
     const helperSheet = ss.getSheetByName("DeliveriesHelpTable");
     const routeDriverMap = {};
     if (helperSheet) {
         const helperData = helperSheet.getDataRange().getValues().slice(1);
         helperData.forEach(row => { 
-            const routeKey = String(row[0] || '').trim();
-            const driverValue = String(row[1] || '').trim();
-            if (routeKey) routeDriverMap[routeKey] = driverValue; 
+            if (row[0]) routeDriverMap[String(row[0]).trim()] = String(row[1] || 'TBD').trim(); 
         });
     }
 
-    // --- 3. Filter Data and Process Each Delivery Row ---
-    const deliveriesData = [];
-    const labelFontSizeMap = {}; // Maps the delivery index to font sizes
-    let deliveryIndexCounter = 0; // Counter for mapping purposes
+    // 4. Process Rows
+    const finalOutput = [];
+    const labelFormatting = []; // Store font sizes for later
 
-    const filteredDataRows = dataRows
-        // Filter by Conf for * = 'YES' or includes 'NO ANS'
-        .filter(row => {
-            const confValue = String(row[confForIdx] || '').toUpperCase().trim();
-            return confValue === 'YES' || confValue.includes('NO ANS');
-        });
+    const filteredRows = dataRows.filter(row => {
+        const confValue = String(row[confForIdx] || '').toUpperCase().trim();
+        return confValue === 'YES' || confValue.includes('NO ANS');
+    });
 
-    filteredDataRows.forEach(row => {
+    filteredRows.forEach(row => {
         const name = String(row[nameIdx] || 'UNKNOWN NAME');
         const route = String(row[routeIdx] || 'UNKNOWN ROUTE').trim();
         const driver = routeDriverMap[route] || "TBD";
-        
-        // Dynamic Font Size Emulation for Name
-        const baseNameFontSize = 12;
-        const reducedNameFontSize = 10;
-        const maxNameLength = 20; 
-        const nameFontSize = name.length > maxNameLength ? reducedNameFontSize : baseNameFontSize;
 
-        // Dynamic Font Size Emulation for Driver (USING USER'S CUSTOM VALUES)
-        const baseDriverFontSize = 13;
-        const reducedDriverFontSize = 11;
-        const maxDriverLength = 20;
-        const driverFontSize = driver.length > maxDriverLength ? reducedDriverFontSize : baseDriverFontSize;
+        // Bag Logic (Max 3)
+        let totalBags = 0;
+        if (diapers1Idx !== -1 && String(row[diapers1Idx]).trim() !== "") totalBags++;
+        if (diapers2Idx !== -1 && String(row[diapers2Idx]).trim() !== "") totalBags++;
+        if (diapers3Idx !== -1 && String(row[diapers3Idx]).trim() !== "") totalBags++;
+        totalBags += Math.ceil(parseFloat(row[wipesIdx] || 0));
+        totalBags += Math.ceil(parseFloat(row[dogFoodIdx] || 0)) + Math.ceil(parseFloat(row[catFoodIdx] || 0));
+        totalBags = Math.min(totalBags, 3);
 
+        if (totalBags > 0) {
+            const row1Data = [];
+            const row2Data = [];
 
-        // --- Bag Count Logic (Only counts bulky items) ---
-        let bagCount = 0;
+            for (let j = 0; j < 3; j++) { // 3 labels per row
+                if (j < totalBags) {
+                    // REQUIREMENT 1: Row 1 = Name | Bag # of #
+                    row1Data.push(name, `BAG ${j + 1} of ${totalBags}`);
 
-        // A. Diapers: 1 bag per non-empty column (max 3)
-        if (diapers1Idx !== -1 && String(row[diapers1Idx]).trim() !== "") bagCount++;
-        if (diapers2Idx !== -1 && String(row[diapers2Idx]).trim() !== "") bagCount++;
-        if (diapers3Idx !== -1 && String(row[diapers3Idx]).trim() !== "") bagCount++;
+                    // REQUIREMENT 2: Row 2 Logic based on user options
+                    let row2Content = "";
+                    if (finalConfig.includeDriverNames) {
+                        row2Content = driver;
+                    } else if (finalConfig.includeRouteNames) {
+                        row2Content = route;
+                    } else if (finalConfig.includeAbbreviatedRouteNames) {
+                        row2Content = abbreviateRoute(route);
+                    }
+                    // else: "without drivers or routes" remains ""
 
-        // B. Wipes: 1 bag per whole quantity
-        const wipesQty = parseFloat(row[wipesIdx] || 0) || 0;
-        bagCount += Math.ceil(wipesQty);
-        
-        // C. Pet Food: 1 bag per whole quantity
-        const dogFoodQty = parseFloat(row[dogFoodIdx] || 0) || 0;
-        const catFoodQty = parseFloat(row[catFoodIdx] || 0) || 0;
-        bagCount += Math.ceil(dogFoodQty) + Math.ceil(catFoodQty);
-        
-        // --- IMPLEMENT HARD LIMIT OF 3 LABELS ---
-        bagCount = Math.min(bagCount, 3);
-        
-        if (bagCount > 0) {
-             const delivery = {
-                Name: name,
-                Driver: driver,
-                TotalLabels: bagCount
-            };
-            
-            deliveriesData.push(delivery);
-            
-            // Store font size metadata keyed by the delivery index
-            labelFontSizeMap[deliveryIndexCounter] = { 
-                name: nameFontSize,
-                driver: driverFontSize
-            };
-            deliveryIndexCounter++;
-        }
-    });
-
-    // --- 4. Format Output into Grouped Delivery Layout (2 Rows per Delivery) ---
-    const finalOutput = [];
-    const labelsPerRow = 3;
-    const labelHeightRows = 2; // *** RESTORED: 2 rows per physical label ***
-    const labelWidthCols = 2;  
-    const totalCols = labelsPerRow * labelWidthCols; // 6 columns 
-    
-    // Store the delivery index corresponding to each new row pair for formatting later
-    const outputRowMapping = []; 
-
-    deliveriesData.forEach((delivery, index) => {
-        const row1Data = []; // Name and Bag Numbers
-        const row2Data = []; // Driver Names
-        
-        const numLabelsToGenerate = delivery.TotalLabels;
-
-        for (let j = 0; j < labelsPerRow; j++) {
-            if (j < numLabelsToGenerate) {
-                // Generate content for this label slot
-                const nameLine = `${delivery.Name}`;
-                const detailLine = `${delivery.Driver}`; // Driver Name Only
-                const numberLine = `BAG ${j + 1}/${delivery.TotalLabels}`;
-
-                // Row 1: Name and Bag Number
-                row1Data.push(nameLine, numberLine);
-                // Row 2: Driver Name (Pushed twice for merging later)
-                row2Data.push(detailLine, detailLine); 
-            } else {
-                // Leave the remaining slots blank
-                row1Data.push("", ""); 
-                row2Data.push("", ""); 
+                    row2Data.push(row2Content, ""); // Empty col for merge
+                } else {
+                    row1Data.push("", "");
+                    row2Data.push("", "");
+                }
             }
+            finalOutput.push(row1Data, row2Data);
+            
+            // Store sizing info (matching your painstakingly set fonts)
+            labelFormatting.push({
+                nameSize: name.length > 20 ? 10 : 12,
+                detailSize: driver.length > 20 ? 11 : 13
+            });
         }
-        
-        finalOutput.push(row1Data, row2Data); // Push both rows for the delivery
-        // Store the index of the delivery
-        outputRowMapping.push(index);
     });
-    
-    if (finalOutput.length === 0) {
-        SpreadsheetApp.getUi().alert("No confirmed deliveries with items found to generate labels.");
-        return;
+
+    // 5. Write to Sheet
+    if (finalOutput.length > 0) {
+        outputSheet.getRange(1, 1, finalOutput.length, 6).setValues(finalOutput);
+        applyGridFormatting(outputSheet, finalOutput.length, labelFormatting);
     }
-    
-    // --- 5. Write Data to Sheet ---
-    
-    outputSheet.getRange(1, 1, finalOutput.length, totalCols).setValues(finalOutput);
-
-    // --- 6. Formatting and Sizing for Avery 6240 (30-up) ---
-    
-    // Set column widths for printing (Columns A/B, C/D, E/F form the 3 labels)
-    //const width = 250;
-    const width = 258; 
-    outputSheet.setColumnWidth(1, width * 0.7); // Name/Route Line (70%)
-    outputSheet.setColumnWidth(2, width * 0.3); // Label Number (30%)
-    outputSheet.setColumnWidth(3, width * 0.7);
-    outputSheet.setColumnWidth(4, width * 0.3);
-    outputSheet.setColumnWidth(5, width * 0.7);
-    outputSheet.setColumnWidth(6, width * 0.3);
-    
-
-    // Loop through the output data rows (2 rows per delivery)
-    for (let r = 1; r <= finalOutput.length; r += labelHeightRows) { 
-        
-        // Calculate the index of the current delivery block in outputRowMapping
-        const deliveryIndex = outputRowMapping[(r - 1) / labelHeightRows];
-        const deliveryInfo = deliveriesData[deliveryIndex];
-        const numLabels = deliveryInfo.TotalLabels;
-
-        // *** RESTORED: Set both Row Heights to 36px (36px + 36px = 72px total label height) ***
-        //outputSheet.setRowHeight(r, 36); // Row 1 (Name/Number)
-        //outputSheet.setRowHeight(r + 1, 36); // Row 2 (Driver)
-        outputSheet.setRowHeight(r, 51.5); // Row 1 (Name/Number)
-        outputSheet.setRowHeight(r + 1, 51.5); // Row 2 (Driver)
-
-        // General Formatting for the Label Block (2 rows x 6 columns)
-        const labelBlock = outputSheet.getRange(r, 1, labelHeightRows, totalCols);
-
-        // Explicitly remove all borders (Top, Bottom, Left, Right, Vertical, Horizontal)
-        labelBlock.setBorder(false, false, false, false, false, false); 
-
-        // Align all content to the middle vertically
-        labelBlock.setFontWeight("bold").setVerticalAlignment("middle").setHorizontalAlignment("center");
-        
-        // --- Apply Dynamic Font Sizing for Names and Drivers ---
-
-        // Get the font sizing metadata for this delivery
-        const formatting = labelFontSizeMap[deliveryIndex];
-        const nameFontSize = formatting ? formatting.name : 12; 
-        const driverFontSize = formatting ? formatting.driver : 13; 
-
-        // Apply formatting across all generated labels in this row pair
-        for (let j = 0; j < numLabels; j++) {
-            const colNameStart = j * 2 + 1; // 1, 3, 5
-            const colBagStart = j * 2 + 2; // 2, 4, 6
-
-            // Row 2: Driver Name Merging (Must happen first)
-            outputSheet.getRange(r + 1, colNameStart, 1, 2).mergeAcross();
-            
-            // Row 1, Name Cell (Dynamic Font Size)
-            outputSheet.getRange(r, colNameStart, 1, 1)
-                .setFontSize(nameFontSize)
-                .setWrap(false)
-                .setFontColor("#000000") // Black color
-                .setHorizontalAlignment("center");
-            
-            // Row 1, Bag Number Cell (Fixed Font Size)
-            outputSheet.getRange(r, colBagStart, 1, 1)
-                .setFontSize(10)
-                .setFontWeight("normal")
-                .setHorizontalAlignment("left");
-
-            // Row 2, Driver Name Cell (Dynamic Font Size) - Applies to the merged range
-            outputSheet.getRange(r + 1, colNameStart, 1, 2)
-                .setFontSize(driverFontSize) // *** DYNAMIC FONT SIZE APPLIED HERE ***
-                .setFontColor("#3C78D8") // Blue color
-                .setHorizontalAlignment("center"); 
-        }
-    }
-
-    // --- Safely delete excess rows and columns ---
-    
-    const maxRows = outputSheet.getMaxRows();
-    const rowsToDelete = maxRows - finalOutput.length;
-    if (rowsToDelete > 0) {
-        outputSheet.deleteRows(finalOutput.length + 1, rowsToDelete);
-    }
-    
-    const maxCols = outputSheet.getMaxColumns();
-    const colsToDelete = maxCols - totalCols;
-    if (colsToDelete > 0) {
-        outputSheet.deleteColumns(totalCols + 1, colsToDelete);
-    }
-    
-    SpreadsheetApp.flush();
-
-    return timestamp;
 }
 
+/**
+ * Formatting function strictly maintains your calibrated Avery dimensions
+ */
+function applyGridFormatting(sheet, totalRows, formatting) {
+    const width = 258;
+    sheet.setColumnWidths(1, 6, width * 0.3); // Reset
+    [1, 3, 5].forEach(col => sheet.setColumnWidth(col, width * 0.7));
+    [2, 4, 6].forEach(col => sheet.setColumnWidth(col, width * 0.3));
 
-// Updated function signature for clarity
+    for (let r = 1; r <= totalRows; r += 2) {
+        sheet.setRowHeight(r, 51.5);
+        sheet.setRowHeight(r + 1, 51.5);
+        
+        const fmt = formatting[(r - 1) / 2];
+
+        for (let c = 1; c <= 5; c += 2) {
+            // Row 1 Formatting
+            sheet.getRange(r, c).setFontSize(fmt.nameSize).setFontWeight("bold");
+            sheet.getRange(r, c + 1).setFontSize(10).setHorizontalAlignment("right");
+
+            // Row 2 Formatting (Merged as per your grid)
+            const row2Range = sheet.getRange(r + 1, c, 1, 2);
+            if (!row2Range.isPartOfMerge()) row2Range.mergeAcross();
+            row2Range.setFontSize(fmt.detailSize).setFontColor("#3C78D8").setHorizontalAlignment("center");
+        }
+    }
+}
+
+// Menu Wrappers
+function generateWithoutDrivers() { generateDeliveryLabels({}); }
+function generateWithDrivers() { generateDeliveryLabels({ includeDriverNames: true }); }
+function generateWithRoutes() { generateDeliveryLabels({ includeRouteNames: true }); }
+function generateWithAbbreviatedRoutes() { generateDeliveryLabels({ includeAbbreviatedRouteNames: true }); }
+
+
 function generateDeliveryLabels(config = {}) {
     const defaults = {
-        includeDriverNames: false // Default: Include driver names
+        includeDriverNames: false,
+        includeRouteNames: false,            // New default
+        includeAbbreviatedRouteNames: true   // Per Gavi's request: Default to Abbreviations
     };
     const finalConfig = { ...defaults, ...config };
     
@@ -2401,34 +2534,37 @@ function generateDeliveryLabels(config = {}) {
     const outputSheetName = "DeliveryLabels";
 
     if (!dataSheet) {
-        SpreadsheetApp.getUi().alert("Source sheet 'Deliveries-UPDATE HERE' not found. Cannot generate labels.");
+        SpreadsheetApp.getUi().alert("Source sheet 'Deliveries-UPDATE HERE' not found.");
         return;
     }
     
-    // 1. Setup/Initialization
     const outputSheet = setupOutputSheet(ss, dataSheet, outputSheetName);
-    
-    // 2. Data Extraction and Pre-processing
     const { headers, dataRows } = getSourceData(dataSheet);
     const indices = getColumnIndices(headers);
+
     if (!indices.isValid) {
-        SpreadsheetApp.getUi().alert("Missing essential columns (Name, routeDescription, or Conf for *). Cannot generate labels.");
+        SpreadsheetApp.getUi().alert("Missing essential columns. Cannot generate labels.");
         return;
     }
+
     const routeDriverMap = getRouteDriverMap(ss);
 
-    // 3. Generate Individual Labels (New Flat Structure)
+    // Generate the labels - pass the config here if your label generator 
+    // needs to know about routes early on
     const { allLabels, labelFontSizeMap } = generateAllIndividualLabels(dataRows, indices, routeDriverMap);
 
     if (allLabels.length === 0) {
-        SpreadsheetApp.getUi().alert("No confirmed deliveries with items found to generate labels.");
+        SpreadsheetApp.getUi().alert("No confirmed deliveries found.");
         return;
     }
 
-    // 4. Format Output into Continuous Matrix
-    const { finalOutput, outputLabelMapping } = formatContinuousLabelData(allLabels, finalConfig.includeDriverNames);
+    // --- STEP 4: This is where the magic happens ---
+    // Pass the finalConfig so the formatter knows which string to build
+    const { finalOutput, outputLabelMapping } = formatContinuousLabelData(
+        allLabels, 
+        finalConfig
+    );
     
-    // 5. Write Data and Apply Formatting
     writeAndFormatContinuousLabels(outputSheet, finalOutput, outputLabelMapping, allLabels, labelFontSizeMap, finalConfig);
     
     SpreadsheetApp.flush();
