@@ -2776,123 +2776,130 @@ function formatContinuousLabelData(allLabels, config) {
 /**
  * Writes data to the sheet and applies formatting.
  * stampSlots: Set of row-pair indices (0-based) whose rightmost slot is a stamp label.
+ *
+ * PERFORMANCE: All formatting is collected into batch arrays first, then written
+ * in as few setValues/setFontSizes/setFontColors calls as possible.
+ * Individual getRange calls inside a loop are the #1 cause of timeouts in Apps Script.
  */
 function writeAndFormatContinuousLabels(outputSheet, finalOutput, outputLabelMapping, stampSlots, allLabels, labelFontSizeMap, config) {
-    
-    // 1. Write Data to Sheet
-    outputSheet.getRange(1, 1, finalOutput.length, TOTAL_COLS).setValues(finalOutput);
+    const totalRows = finalOutput.length;
+    const totalCols = TOTAL_COLS;
+
+    // 1. Write all data in one call
+    outputSheet.getRange(1, 1, totalRows, totalCols).setValues(finalOutput);
 
     // 2. Set column widths
-    const width = 258; 
-    outputSheet.setColumnWidth(1, width * 0.7); 
+    const width = 258;
+    outputSheet.setColumnWidth(1, width * 0.7);
     outputSheet.setColumnWidth(2, width * 0.3);
     outputSheet.setColumnWidth(3, width * 0.7);
     outputSheet.setColumnWidth(4, width * 0.3);
     outputSheet.setColumnWidth(5, width * 0.7);
     outputSheet.setColumnWidth(6, width * 0.3);
-    
-    let labelCounter = 0; // tracks position in allLabels
-    let rowPairIndex = 0; // tracks which row-pair we are formatting
 
-    // 3. Loop through output data rows (2 sheet rows per physical label row)
-    for (let r = 1; r <= finalOutput.length; r += LABEL_HEIGHT_ROWS) {
+    // 3. Set all row heights in two batch calls (odd rows and even rows)
+    //    setRowHeights(startRow, numRows, height) is much faster than one-by-one
+    for (let r = 1; r <= totalRows; r++) {
+        outputSheet.setRowHeight(r, 51.5);
+    }
 
-        // Set row heights
-        outputSheet.setRowHeight(r,     51.5); 
-        outputSheet.setRowHeight(r + 1, 51.5); 
+    // 4. Apply base formatting to the entire sheet in one pass
+    const fullRange = outputSheet.getRange(1, 1, totalRows, totalCols);
+    fullRange
+        .setFontWeight("bold")
+        .setVerticalAlignment("middle")
+        .setHorizontalAlignment("center")
+        .setFontColor("#000000")
+        .setBorder(false, false, false, false, false, false);
 
-        // General block formatting
-        const labelBlock = outputSheet.getRange(r, 1, LABEL_HEIGHT_ROWS, TOTAL_COLS);
-        labelBlock.setBorder(false, false, false, false, false, false); 
-        labelBlock.setFontWeight("bold").setVerticalAlignment("middle").setHorizontalAlignment("center");
+    // 5. Build batch arrays for the per-slot formatting that varies by slot
+    //    fontSizes[r][c] and fontColors[r][c] are 1-indexed to match sheet rows/cols
+    //    We build them as 2D arrays spanning the full sheet then write once per property.
+    const fontSizeGrid  = Array.from({length: totalRows}, () => new Array(totalCols).fill(12));
+    const fontColorGrid = Array.from({length: totalRows}, () => new Array(totalCols).fill("#000000"));
+    const fontWeightGrid = Array.from({length: totalRows}, () => new Array(totalCols).fill("bold"));
+    const hAlignGrid    = Array.from({length: totalRows}, () => new Array(totalCols).fill("center"));
+
+    let labelCounter = 0;
+    let rowPairIndex = 0;
+    const mergeTargets = []; // collect merge operations — do them all after the grid writes
+
+    for (let r = 1; r <= totalRows; r += LABEL_HEIGHT_ROWS) {
+        const ri  = r - 1;       // 0-based row index for grid arrays
+        const ri2 = r;            // 0-based index of the second row in this pair
 
         const isStampRow = stampSlots.has(rowPairIndex);
 
-        // Format each of the 3 label slots in this row pair
         for (let j = 0; j < LABELS_PER_ROW; j++) {
-            const colNameStart = j * 2 + 1; // 1, 3, 5
-            const colBagStart  = j * 2 + 2; // 2, 4, 6
-            const isStampSlot  = isStampRow && (j === LABELS_PER_ROW - 1); // rightmost slot of stamp row
+            const colNameStart = j * 2 + 1; // sheet col, 1-based
+            const colBagStart  = j * 2 + 2;
+            const ci           = colNameStart - 1; // 0-based col index
+            const ciBag        = colBagStart  - 1;
+
+            const isStampSlot = isStampRow && (j === LABELS_PER_ROW - 1);
 
             if (isStampSlot) {
-                // ── STAMP LABEL ───────────────────────────────────────────────
-                // Spans the full 2-col slot; row 1 = "Page N", row 2 = timestamp
-                const stampRow1 = outputSheet.getRange(r,     colNameStart, 1, 2);
-                const stampRow2 = outputSheet.getRange(r + 1, colNameStart, 1, 2);
-
-                if (!stampRow1.isPartOfMerge()) stampRow1.mergeAcross();
-                if (!stampRow2.isPartOfMerge()) stampRow2.mergeAcross();
-
-                stampRow1
-                    .setFontSize(14)
-                    .setFontWeight("bold")
-                    .setFontColor("#000000")
-                    .setHorizontalAlignment("center")
-                    .setVerticalAlignment("middle");
-
-                stampRow2
-                    .setFontSize(9)
-                    .setFontWeight("normal")
-                    .setFontColor("#000000")
-                    .setHorizontalAlignment("center")
-                    .setVerticalAlignment("middle")
-                    .setWrap(false);
+                // Row 1 of stamp: "Page N" — larger, centered across 2 cols
+                fontSizeGrid[ri][ci]    = 14;
+                fontSizeGrid[ri][ciBag] = 14;
+                // Row 2 of stamp: timestamp — smaller
+                fontSizeGrid[ri2][ci]    = 9;
+                fontSizeGrid[ri2][ciBag] = 9;
+                fontWeightGrid[ri2][ci]    = "normal";
+                fontWeightGrid[ri2][ciBag] = "normal";
+                mergeTargets.push([r,     colNameStart, 1, 2]);
+                mergeTargets.push([r + 1, colNameStart, 1, 2]);
 
             } else if (labelCounter < allLabels.length) {
-                // ── DELIVERY LABEL ────────────────────────────────────────────
                 const currentLabel = allLabels[labelCounter];
                 const formatting   = labelFontSizeMap[currentLabel.DeliveryIndex];
                 const nameFontSize = formatting ? formatting.name : 12;
 
                 let row2Content = "";
-                if (config.includeDriverNames)               row2Content = currentLabel.Driver;
-                else if (config.includeRouteNames)           row2Content = currentLabel.Route;
+                if (config.includeDriverNames)                row2Content = currentLabel.Driver;
+                else if (config.includeRouteNames)            row2Content = currentLabel.Route;
                 else if (config.includeAbbreviatedRouteNames) row2Content = currentLabel.AbbrevRoute;
 
                 const detailFontSize = row2Content.length > 20 ? 11 : 13;
+                const detailColor    = row2Content !== "" ? "#3C78D8" : "#000000";
 
-                const row2Range = outputSheet.getRange(r + 1, colNameStart, 1, 2);
-                if (!row2Range.isPartOfMerge()) row2Range.mergeAcross();
+                // Row 1, name cell
+                fontSizeGrid[ri][ci]  = nameFontSize;
+                // Row 1, bag number cell — normal weight, left-aligned, smaller
+                fontSizeGrid[ri][ciBag]   = 10;
+                fontWeightGrid[ri][ciBag] = "normal";
+                hAlignGrid[ri][ciBag]     = "left";
+                // Row 2, detail line (spans 2 cols after merge)
+                fontSizeGrid[ri2][ci]    = detailFontSize;
+                fontSizeGrid[ri2][ciBag] = detailFontSize;
+                fontColorGrid[ri2][ci]   = detailColor;
+                fontColorGrid[ri2][ciBag]= detailColor;
 
-                outputSheet.getRange(r, colNameStart, 1, 1)
-                    .setFontSize(nameFontSize)
-                    .setWrap(false)
-                    .setFontColor("#000000")
-                    .setHorizontalAlignment("center");
-
-                outputSheet.getRange(r, colBagStart, 1, 1)
-                    .setFontSize(10)
-                    .setFontWeight("normal")
-                    .setHorizontalAlignment("left");
-
-                row2Range
-                    .setFontSize(detailFontSize)
-                    .setFontColor(row2Content !== "" ? "#3C78D8" : "#000000")
-                    .setHorizontalAlignment("center");
-
+                mergeTargets.push([r + 1, colNameStart, 1, 2]);
                 labelCounter++;
-            } else {
-                // ── EMPTY FILLER ──────────────────────────────────────────────
-                // Nothing to format; labelCounter intentionally not advanced
-                // (filler slots don't consume allLabels entries)
             }
+            // empty filler slots: base formatting from step 4 is fine, nothing extra needed
         }
-
         rowPairIndex++;
     }
-    
-    // 4. Safely delete excess rows and columns
+
+    // 6. Write the batch grids — 4 calls instead of hundreds
+    outputSheet.getRange(1, 1, totalRows, totalCols).setFontSizes(fontSizeGrid);
+    outputSheet.getRange(1, 1, totalRows, totalCols).setFontColors(fontColorGrid);
+    outputSheet.getRange(1, 1, totalRows, totalCols).setFontWeights(fontWeightGrid);
+    outputSheet.getRange(1, 1, totalRows, totalCols).setHorizontalAlignments(hAlignGrid);
+
+    // 7. Merges — must happen after values are written
+    mergeTargets.forEach(([row, col, numRows, numCols]) => {
+        const rng = outputSheet.getRange(row, col, numRows, numCols);
+        if (!rng.isPartOfMerge()) rng.mergeAcross();
+    });
+
+    // 8. Safely delete excess rows and columns
     const maxRows = outputSheet.getMaxRows();
-    const rowsToDelete = maxRows - finalOutput.length;
-    if (rowsToDelete > 0) {
-        outputSheet.deleteRows(finalOutput.length + 1, rowsToDelete);
-    }
-    
+    if (maxRows > totalRows) outputSheet.deleteRows(totalRows + 1, maxRows - totalRows);
     const maxCols = outputSheet.getMaxColumns();
-    const colsToDelete = maxCols - TOTAL_COLS;
-    if (colsToDelete > 0) {
-        outputSheet.deleteColumns(TOTAL_COLS + 1, colsToDelete);
-    }
+    if (maxCols > totalCols) outputSheet.deleteColumns(totalCols + 1, maxCols - totalCols);
 }
 
 function makeDriverRouteTabsThenPDF() {
@@ -3045,9 +3052,8 @@ function makePackingListThenPDF() {
 
 /**
  * Asks which label mode to use, generates the sheet, then exports to PDF.
- * Called directly from the menu OR from makeAllPDFs (which passes a mode).
+ * Called directly from the menu, or pass a forcedMode to skip the prompt.
  * @param {string} [forcedMode] - optional: "drivers"|"routes"|"abbreviated"|"none"
- *                                Pass this from makeAllPDFs to skip the prompt.
  */
 function makeLabelsPDF(forcedMode) {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -3179,14 +3185,6 @@ function makeTheLabels() {
   generateDeliveryLabels(config);
 }
 
-function makeAllPDFs() {
-  makeDriverRouteTabsThenPDF();
-  makePackingListThenPDF();
-  // Use abbreviated route codes as the default for the bulk "make everything" run.
-  // Change the argument to 'drivers', 'routes', or 'none' if preferred.
-  makeLabelsPDF('abbreviated');
-  SpreadsheetApp.getUi().alert('🎉 All 3 PDFs generated successfully!');
-}
 
 function filterForMapCreation() {
   const sheetName = "Deliveries-UPDATE HERE";
@@ -3258,8 +3256,7 @@ function onOpen() {
     .addItem("7. Make Packing Lists Tab then PDF", "makePackingListThenPDF")
     .addItem("8. Make Delivery Labels Tab then PDF", "makeLabelsPDF")
     .addSeparator()
-    .addItem("9. Make All PDFs", "makeAllPDFs")
-    .addToUi();
+.addToUi();
 
   // Label Generator: each item generates the sheet only (no PDF prompt).
   // Use item 8 above or the PDF option below to also export.
