@@ -2618,49 +2618,79 @@ function generateAllIndividualLabels(dataRows, indices, routeDriverMap) {
             return confValue === 'YES' || confValue.includes('NO ANS');
         });
 
+    // Group filtered rows by route, then sort routes alphabetically —
+    // matching the sort order used by makeDriverRouteTabs and generatePackingListRouteSections.
+    const groupedByRoute = {};
     filteredDataRows.forEach(row => {
-        const name = String(row[indices.nameIdx] || 'UNKNOWN NAME');
         const route = String(row[indices.routeIdx] || 'UNKNOWN ROUTE').trim();
-        const driver = routeDriverMap[route] || "TBD";
-        const totalLabels = calculateBagCount(row, indices);
-        
-        if (totalLabels > 0) {
-            // Determine Font Sizes
-            const baseNameFontSize = 12;
-            const reducedNameFontSize = 10;
-            const maxNameLength = 20; 
-            const nameFontSize = name.length > maxNameLength ? reducedNameFontSize : baseNameFontSize;
-            
-            const baseDriverFontSize = 13;
-            const reducedDriverFontSize = 11;
-            const maxDriverLength = 20;
-            const driverFontSize = driver.length > maxDriverLength ? reducedDriverFontSize : baseDriverFontSize;
+        if (!groupedByRoute[route]) groupedByRoute[route] = [];
+        groupedByRoute[route].push(row);
+    });
+    const sortedRoutes = Object.keys(groupedByRoute).sort();
 
-            const abbrevRoute = abbreviateRoute(route);
+    sortedRoutes.forEach(route => {
+        groupedByRoute[route].forEach(row => {
+            const name = String(row[indices.nameIdx] || 'UNKNOWN NAME');
+            const driver = routeDriverMap[route] || "TBD";
+            const totalLabels = calculateBagCount(row, indices);
 
-            // Generate an entry for *each* required label
-            for (let i = 1; i <= totalLabels; i++) {
-                allLabels.push({
-                    Name: name,
-                    Driver: driver,
-                    Route: route,
-                    AbbrevRoute: abbrevRoute,
-                    BagNumber: i,
-                    TotalLabels: totalLabels,
-                    DeliveryIndex: deliveryIndexCounter // Reference for formatting map
-                });
+            if (totalLabels > 0) {
+                // Determine Font Sizes
+                const baseNameFontSize = 12;
+                const reducedNameFontSize = 10;
+                const maxNameLength = 20;
+                const nameFontSize = name.length > maxNameLength ? reducedNameFontSize : baseNameFontSize;
+
+                const baseDriverFontSize = 13;
+                const reducedDriverFontSize = 11;
+                const maxDriverLength = 20;
+                const driverFontSize = driver.length > maxDriverLength ? reducedDriverFontSize : baseDriverFontSize;
+
+                const abbrevRoute = abbreviateRoute(route);
+
+                // Generate an entry for *each* required label
+                for (let i = 1; i <= totalLabels; i++) {
+                    allLabels.push({
+                        Name: name,
+                        Driver: driver,
+                        Route: route,
+                        AbbrevRoute: abbrevRoute,
+                        BagNumber: i,
+                        TotalLabels: totalLabels,
+                        DeliveryIndex: deliveryIndexCounter // Reference for formatting map
+                    });
+                }
+
+                // Store font size metadata keyed by the delivery index
+                labelFontSizeMap[deliveryIndexCounter] = {
+                    name: nameFontSize,
+                    driver: driverFontSize
+                };
+                deliveryIndexCounter++;
             }
-
-            // Store font size metadata keyed by the delivery index
-            labelFontSizeMap[deliveryIndexCounter] = { 
-                name: nameFontSize,
-                driver: driverFontSize
-            };
-            deliveryIndexCounter++;
-        }
+        });
     });
 
-    return { allLabels, labelFontSizeMap };
+    // Pad route boundaries: insert empty filler slots so every new route
+    // starts at the beginning of a fresh label row (column 1 of 3).
+    // This lets drivers/volunteers cut the sheet cleanly by route.
+    const paddedLabels = [];
+    let slotCount = 0; // tracks position within current label row (0, 1, or 2)
+    for (let i = 0; i < allLabels.length; i++) {
+        const isNewRoute = i > 0 && allLabels[i].Route !== allLabels[i - 1].Route;
+        if (isNewRoute && slotCount !== 0) {
+            // Fill remaining slots in this row with blanks, then reset
+            const padNeeded = LABELS_PER_ROW - slotCount;
+            for (let p = 0; p < padNeeded; p++) {
+                paddedLabels.push({ _pad: true, DeliveryIndex: -1 });
+                slotCount = (slotCount + 1) % LABELS_PER_ROW;
+            }
+        }
+        paddedLabels.push(allLabels[i]);
+        slotCount = (slotCount + 1) % LABELS_PER_ROW;
+    }
+
+    return { allLabels: paddedLabels, labelFontSizeMap };
 }
 
 /**
@@ -2737,7 +2767,8 @@ function formatContinuousLabelData(allLabels, config) {
                 // Slot 15 (0-based: 14) is always the stamp
                 pageSlots.push(stampSlot(pageNumber, timestamp));
             } else if (labelIndex < allLabels.length) {
-                pageSlots.push(deliverySlot(allLabels[labelIndex++], config));
+                const lbl = allLabels[labelIndex++];
+                pageSlots.push(lbl._pad ? emptySlot() : deliverySlot(lbl, config));
             } else {
                 pageSlots.push(emptySlot());
             }
@@ -2852,6 +2883,11 @@ function writeAndFormatContinuousLabels(outputSheet, finalOutput, outputLabelMap
 
             } else if (labelCounter < allLabels.length) {
                 const currentLabel = allLabels[labelCounter];
+                // _pad sentinels are empty slots — skip formatting, just advance counter
+                if (currentLabel._pad) {
+                    labelCounter++;
+                    continue;
+                }
                 const formatting   = labelFontSizeMap[currentLabel.DeliveryIndex];
                 const nameFontSize = formatting ? formatting.name : 12;
 
@@ -3255,7 +3291,6 @@ function onOpen() {
     .addItem("6. Make Driver Route Tabs then PDF", "makeDriverRouteTabsThenPDF")
     .addItem("7. Make Packing Lists Tab then PDF", "makePackingListThenPDF")
     .addItem("8. Make Delivery Labels Tab then PDF", "makeLabelsPDF")
-    .addSeparator()
 .addToUi();
 
   // Label Generator: each item generates the sheet only (no PDF prompt).
