@@ -9,100 +9,171 @@ This is a Google Apps Script project. There is no build step and no npm. The ent
 2. Open the WAWG Google Sheet
 3. Click **Extensions → Apps Script**
 4. Select all existing code and replace it with the contents of `Code.js`
-5. Click **Save** (floppy disk icon or Ctrl+S)
-6. Reload the Google Sheet and test from the menus
+5. Replace `appsscript.json` contents with the repo version (preserves the required OAuth scopes)
+6. Click **Save** (floppy disk icon or Ctrl+S)
+7. Reload the Google Sheet and test from the menus
 
 ---
 
 ## Project Structure
 
-There is one file: `Code.js`. It is organized into logical sections:
+One file: `Code.js`. Organized into logical sections:
 
-| Section | What's in it |
+| Section | Key functions |
 |---|---|
-| Top of file | `refreshDeliveriesHelpTable`, helper utilities |
-| `makeDriverRouteTabs` | Builds per-route sheets for drivers |
-| `makePackingLists` | Builds the PackingLists tab |
-| Label generation | `generateDeliveryLabels`, `formatContinuousLabelData`, `writeAndFormatContinuousLabels`, `abbreviateRoute`, `formatRouteCode` |
-| PDF exports | `makeDriverRouteTabsThenPDF`, `makePackingListThenPDF`, `makeLabelsPDF` |
+| Top of file | Constants (`ROUTE_BATCH_SIZE`, `AUTO_GENERATE_MAP_LINKS`, `PROP_*`), `refreshDeliveriesHelpTable` |
+| Batched route generation | `makeDriverRouteTabs`, `continueDriverRouteTabs`, `cancelDriverRouteTabs`, `_routeBatch_*` helpers |
+| Route sheet helpers | `buildRouteSheet`, `writeFullRouteHeader`, `writeStopTable`, `writeSTR1`–`writeSTR5`, `routeSheetStopBucket` |
+| Map utilities | `buildAutoMapUrl`, `buildRouteMapInfo`, `extractMapLinkForRoute`, `shortenUrlForTyping` |
+| Navigator Dashboard | `makeNaviDash`, `writeDashboardTitle`, `generateSpecialItemsTotalsTable`, `generatePerRouteSpecialItemsBreakdown`, `generateSpecialRequestsFlagList`, `generateItemSummaryTable`, `generateConfirmationStatusTable` |
+| Packing lists | `makePackingLists`, `generatePackingListRouteSections`, `packingListSortBucket`, `loadAndIndexPackingData` |
+| Label generation | `generateDeliveryLabels`, `generateAllIndividualLabels`, `formatContinuousLabelData`, `writeAndFormatContinuousLabels`, `abbreviateRoute`, `formatRouteCode` |
+| PDF exports | `makeDriverRouteTabsThenPDF`, `makeNaviDashThenPDF`, `makePackingListThenPDF`, `makeLabelsPDF` |
 | Sheet tools | `makeTheLabels`, `filterForMapCreation`, `clearMapFilter`, `deleteSheetsByPrefix` |
-| Menu | `onOpen` — defines all three custom menus |
+| Menu | `onOpen` |
 
 ---
 
 ## Key Constraints
 
-**Apps Script execution limit is 6 minutes per function call.** Each of the three main deliverable functions (`makeDriverRouteTabs`, `makePackingLists`, `generateDeliveryLabels`) runs close to this limit on a full dataset. Do not attempt to chain them into a single function call. The `makeAllPDFs` combined runner was removed for this reason.
+**Apps Script execution limit is 6 minutes per function call.** Driver route sheet generation (~14s per route × 27 routes = ~380s) exceeds this limit. The `makeDriverRouteTabs` function uses a `PropertiesService` + `ScriptApp.newTrigger` continuation system to split work into batches of 8 routes with a 30-second gap between batches. Total wall time is ~8 minutes across 4 executions.
 
-**Minimize individual `getRange` calls inside loops.** The Sheets API call overhead is the primary driver of execution time. Collect formatting into 2D arrays and write them in one batch call (see `writeAndFormatContinuousLabels` for the pattern). Never call `setFontSize`, `setFontColor`, etc. one cell at a time inside a loop over labels or rows.
+**Route tab generation and PDF export are separate steps.** `makeDriverRouteTabsThenPDF` (menu item 7) does NOT regenerate the tabs — it exports whatever `Route_` tabs already exist. Run item 3 first, wait for completion, then run item 7. This split is intentional and must be preserved.
 
-**`SpreadsheetApp.flush()` is called before PDF export.** This ensures all sheet writes are committed before the export URL is fetched. Don't remove it.
+**`continueDriverRouteTabs` must never appear in the menu.** It is the trigger target function and is called automatically. Adding it to the menu risks users firing it manually and corrupting batch state.
+
+**Minimize individual `getRange` calls inside loops.** Sheets API round-trip overhead dominates execution time. Collect formatting into 2D arrays and write in one batch call. Never call `setFontSize`, `setFontColor`, etc. one cell at a time inside a loop.
+
+**`SpreadsheetApp.flush()` is called before PDF export.** Ensures all sheet writes are committed before the export URL is fetched. Don't remove it.
+
+**The dashboard uses exactly 10 columns (A:J), portrait orientation.** All table banners, merges, and column widths in the NaviDash functions are calibrated for this layout. If you extend a table beyond column J it will break the print layout.
+
+---
+
+## Batch Continuation System
+
+The `_routeBatch_*` private helpers manage state across executions:
+
+| Function | Purpose |
+|---|---|
+| `_routeBatch_prepareData` | Loads and pre-computes all data needed for route sheets |
+| `_routeBatch_runBatch` | Processes N routes, appends to summary rows in PropertiesService |
+| `_routeBatch_finish` | Writes index sheet, clears state, writes completion stamp to Driver_Deliveries col G |
+| `_routeBatch_scheduleTrigger` | Creates a one-shot 30-second trigger calling `continueDriverRouteTabs` |
+| `_routeBatch_cancelTriggers` | Deletes all `continueDriverRouteTabs` triggers by function name |
+| `_routeBatch_clearState` | Deletes all `WAWG_ROUTE_*` PropertiesService keys |
+| `_routeBatch_uiAlert` | Safe alert wrapper — falls back to Logger when called from trigger context |
+
+PropertiesService keys used:
+
+| Key | Contains |
+|---|---|
+| `WAWG_ROUTE_NEXT_IDX` | Integer index of next unprocessed route |
+| `WAWG_ROUTE_NAMES` | JSON array of all route names in order |
+| `WAWG_ROUTE_SUMMARY_ROWS` | JSON array of index sheet rows accumulated across batches |
+| `WAWG_ROUTE_IN_PROGRESS` | `"true"` while a batch job is running |
+| `WAWG_ROUTE_TRIGGER_ID` | Unique ID of the most recently scheduled trigger |
+
+---
+
+## Stop Sort Order
+
+Both driver route sheets and packing lists sort stops/rows within each route by special-items complexity. The sort bucket function (`routeSheetStopBucket` / `packingListSortBucket`) assigns:
+
+| Bucket | Condition |
+|---|---|
+| 1 | No special items |
+| 2 | Dog food only |
+| 3 | Dog + cat food |
+| 4 | Cat food only |
+| 5 | Diapers and/or wipes |
+| 6 | Hygiene only (toiletries / fem hygiene) |
+| 7 | Has special requests — always last |
+
+Special requests always sort last regardless of what other items the delivery has.
+
+---
+
+## Map Link Toggle
+
+```javascript
+const AUTO_GENERATE_MAP_LINKS = false; // top of Code.js
+```
+
+- `false` (default) — reads from the `Delivery Map Links` column in the source sheet
+- `true` — auto-generates a Google Maps waypoint URL (`/maps/search/`) from stop addresses, strips the route name segment from each address, and shortens via is.gd
+
+The toggle only affects the route sheet header map link. The `Driver_Deliveries` index sheet always auto-generates its map URLs regardless of this setting.
 
 ---
 
 ## Adding a New Route
 
-All route abbreviations live in `abbreviateRoute()` inside a `ROUTE_MAP` lookup table. To add a new route:
+All route abbreviations live in `ROUTE_MAP` inside `abbreviateRoute()`. To add a new route:
 
 1. Find `const ROUTE_MAP = {` in `Code.js`
 2. Add one line: `"Exact Route Name As In Sheet": "NEWCOD",`
-3. Follow the format rules in the comment header above the table:
+3. Rules:
    - Standard: 6 alpha + optional integer (`NCOAST1`)
    - Directional: 5 alpha + direction letter + optional integer (`CHVSTW1`)
    - Omit the number if only one route exists with that base name
    - Avoid ending a 6-letter code in N, S, E, or W — `formatRouteCode()` will misread it as a directional
 
-If a route exists in the sheet but has no entry in `ROUTE_MAP`, the full route name prints as a fallback. Nothing breaks silently — you'll see the long name on the label.
+If a route has no entry in `ROUTE_MAP`, the full route name prints as a fallback. Nothing breaks silently.
 
 ---
 
 ## Changing the Default Label Mode
 
-When **Make Delivery Labels Tab then PDF** (menu item 8) is run from the menu it prompts the user. The prompt accepts:
+Menu item 9 (and the Label Generator menu) prompts the user. No hardcoded default. Choices:
 
 - `1` — Driver Names
 - `2` — Full Route Names
 - `3` — Abbreviated Route Codes
 - `4` — No Route Info
 
-There is no hardcoded default for the interactive prompt — the user must choose.
-
 ---
 
-## Testing
+## Testing Checklist
 
-Before opening a PR, test the following manually in the live Google Sheet:
+Before opening a PR, test manually in the live Google Sheet:
 
+- [ ] Item 3 completes all routes across batches without error
+- [ ] `Driver_Deliveries` col G shows `✅ Complete: <timestamp>` after batch finishes
+- [ ] Item 7 exports PDF from existing Route_ tabs (does not regenerate)
+- [ ] Item 4 generates NaviDash — all six sections present, portrait A:J layout
+- [ ] Item 8 exports NaviDash PDF — portrait, filename `Navigator_Dashboard_*`
+- [ ] Item 5 generates PackingLists — routes sorted alphabetically, stops sorted by bucket
 - [ ] All four label modes generate without error
-- [ ] Row 2 is blank in No Route Info mode
-- [ ] Blue text appears on row 2 in all non-blank modes
 - [ ] Abbreviated codes display with spaces: `CHVST W 1` not `CHVSTW1`
 - [ ] Stamp label appears in slot 30 of every Avery sheet; slot 30 is never a delivery label
-- [ ] `makeTheLabels` (menu item 5) prompts and runs without error
-- [ ] `makeLabelsPDF` (menu item 8) prompts for mode and exports to Drive
-- [ ] `makeDriverRouteTabsThenPDF` (menu item 6) completes within ~5 minutes
-- [ ] `makePackingListThenPDF` (menu item 7) completes within ~5 minutes
-- [ ] Print alignment on Avery 6240 stock is not affected by label changes
+- [ ] New routes start on a fresh label row (not mid-row)
+- [ ] ⛔ Cancel Route Tab Generation clears all PropertiesService state and deletes pending triggers
 
 ---
 
 ## What Not to Do
 
-- **Do not add a `makeAllPDFs` combined runner.** It was removed intentionally. See the PR history for context.
-- **Do not use `PropertiesService` for trigger-based continuation chains.** This approach was attempted and removed — it is too slow and too fragile for the data sizes involved.
+- **Do not add a combined "Make All PDFs" runner.** Each deliverable runs close to the 6-minute limit on its own. They cannot be chained.
 - **Do not call formatting methods one cell at a time inside a label loop.** Use batch 2D array writes.
 - **Do not change the Avery 6240 layout constants** (`LABEL_ROWS_PER_PAGE = 10`, `LABELS_PER_ROW = 3`) without re-testing print alignment on physical label stock.
+- **Do not extend NaviDash tables beyond column J.** The PDF export is calibrated for portrait A:J. Going wider breaks the print layout silently.
+- **Do not put `continueDriverRouteTabs` in a menu.** It is a trigger target only.
+
+---
+
+## Tech Debt
+
+- `Packing_Lists_PackingLists.pdf` — the packing list PDF filename does not include a timestamp like other PDF exports. Low priority since the packing list is not printed from PDF anyway.
+- Packing list page breaks cannot be set programmatically in Apps Script. The operator must configure them manually in Sheets before printing. Until Google exposes a page break API (or until the packing list is restructured as a separate per-route tab system similar to the driver route sheets), this manual step cannot be eliminated.
+- `populateRouteTabs` — legacy route sheet writer, retained as a fallback but superseded by `buildRouteSheet`. Can be removed once `buildRouteSheet` has been validated across several distribution cycles.
+- `applyRouteColumnWidths` — small utility function that appears to be unused. Safe to remove in a cleanup pass.
+
 ---
 
 ## License & Sharing
 
-This project is MIT licensed. That was a deliberate choice — contributors and adopting orgs are not required to share their changes publicly or with anyone. You decide what you share and with whom. That boundary is yours.
-
-If you do want to share improvements, compare notes, or just say what your org did with this — reach out:
+MIT licensed — deliberately. Contributors and adopting orgs are not required to share their changes. You decide what you share and with whom.
 
 🐙 **[github.com/ej9erfan](https://github.com/ej9erfan)**
 💬 **[Open a Discussion](https://github.com/ej9erfan/WAWG-Distribution-Scripts/discussions)**
-
-### Tech Debt
-
-- `Packing_Lists_PackingLists.pdf` - This filename result in Google Drive does not get a date/time stamp like the other "make X then PDF" functions. Not really important. This PDF does not get used, because the page breaks are not auto aligned and printing must occur in Google Sheets to align them correctly. Please leave this here until it is somehow possible to make a print job of all of this informatoion in one tab and not split tables across pages. Alternatively, rewrite the Packing lists to act just like the Driver tabs/sheets or roll them all into an all-in-one solution. Which is not desireable becaue the Packing Lists include some administrative information tabls as well. Perhaps the asnwer is to split the driver and packing data from the admin tables....the make a all-in-one route-centric solution for both drivers and preparers.
