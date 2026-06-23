@@ -261,20 +261,10 @@ function _routeBatch_prepareData(ss, dataSheetName) {
     });
   }
 
-  const diapers1Idx = headers.indexOf("diapers1(size)");
-  const diapers2Idx = headers.indexOf("diapers2(size)");
-  const diapers3Idx = headers.indexOf("diapers3(size)");
-  const itemMap = [
-    { label: "food",       sourceHeader: "# packs",         type: "qty" },
-    { label: "eggs",       sourceHeader: "# eggs",          type: "qty" },
-    { label: "milk",       sourceHeader: "# milk",          type: "qty" },
-    { label: "dog food",   sourceHeader: "dogFood(qty)",     type: "qty" },
-    { label: "cat food",   sourceHeader: "catFood(qty)",     type: "qty" },
-    { label: "diapers",    sourceIndex: [diapers1Idx, diapers2Idx, diapers3Idx], type: "diapers" },
-    { label: "wipes",      sourceHeader: "wipes(qty)",       type: "qty" },
-    { label: "toiletries", sourceHeader: "toiletries(qty)",  type: "qty" },
-    { label: "fem hygn",   sourceHeader: "fem hygiene(qty)", type: "qty" },
-  ];
+  // 7) orchestrate sheet creation using existing writer (populateRouteTabs)
+  // We'll call populateRouteTabs per route. Batch 2 will replace this with new builders.
+  const summaryRows = [["Route", "Driver", "Stops", "Open Sheet", "Map"]];
+  const routeNames = Object.keys(grouped).sort();
 
   return { dataSheet, headers, dataRows, routeNames, routeDriverMap, grouped, routeMapInfo, itemMap };
 }
@@ -329,19 +319,19 @@ function _routeBatch_runBatch(ss, prepared, startIdx) {
         mapInfo
       });
 
-      // For the index sheet, always auto-generate the waypoint URL (no shortening needed there)
-      const stopAddresses = Object.values(personStops).map(rows => {
-        const r   = rows[0];
-        const addrIdx = headers.indexOf("Address");
-        const raw = addrIdx !== -1 ? String(r[addrIdx] || "").trim() : "";
-        // Strip route name from address
-        return raw.split(",").map(p => p.trim()).filter(p => p !== route).join(", ");
-      }).filter(a => a.length > 0);
-      const autoMapUrl = buildAutoMapUrl(stopAddresses, "");
+      // Build index entry (with hyperlink to the sheet and auto map URL)
+      const stopAddresses = Object.keys(personStops).map(key => key.split("|")[0]);
+      const autoMapUrl = buildAutoMapUrl(stopAddresses);
+      const mapFormula = autoMapUrl
+        ? `=HYPERLINK("${autoMapUrl}","View Map")`
+        : "No addresses";
+
       summaryRows.push([
-        route, driverName, stopCount,
+        route,
+        driverName,
+        Object.keys(personStops).length,
         `=HYPERLINK("#gid=${sheet.getSheetId()}","Open")`,
-        autoMapUrl ? `=HYPERLINK("${autoMapUrl}","View Map")` : "No addresses"
+        mapFormula
       ]);
       Logger.log(`    route done: +${((Date.now()-tRoute)/1000).toFixed(1)}s  cumulative: +${((Date.now()-t0)/1000).toFixed(1)}s`);
     } catch (err) {
@@ -584,55 +574,18 @@ function shortenUrlForTyping(url) {
    - Google caps the address list at around 10 locations; excess are silently
      dropped by Maps, so we enforce the cap here to keep URLs predictable.
 ------------------------- */
-/**
- * Builds a Google Maps waypoint URL from a list of addresses.
- * Uses /maps/search/ with pipe-separated addresses — shows all stops as
- * individual pins on one map with no imposed driving order.
- * Strips route name segments from addresses before encoding.
- * No hard cap — Maps handles 20+ addresses in search mode fine.
- */
-function buildAutoMapUrl(addresses, routeName) {
+function buildAutoMapUrl(addresses) {
+  const MAX_PINS = 10;
   const clean = addresses
-    .map(a => {
-      // Strip route name from address if present (e.g. "123 Main, Teralta1, San Diego, CA")
-      const raw  = String(a || "").trim();
-      const name = String(routeName || "").trim();
-      if (!name) return raw;
-      return raw.split(",").map(p => p.trim()).filter(p => p !== name).join(", ");
-    })
-    .filter(a => a.length > 0);
+    .map(a => String(a || "").trim())
+    .filter(a => a.length > 0)
+    .slice(0, MAX_PINS);
 
   if (clean.length === 0) return "";
 
+  // /maps/search/ with a pipe-separated query shows multiple pins on one map
   const query = clean.map(a => encodeURIComponent(a)).join("%7C"); // %7C = pipe
   return `https://www.google.com/maps/search/${query}`;
-}
-
-/**
- * AUTO_GENERATE_MAP_LINKS path:
- * Builds a waypoint map URL from a route's stop addresses, shortens it,
- * and returns { link, label } in the same shape as extractMapLinkForRoute.
- */
-function buildRouteMapInfo(personStops, route, headers) {
-  const addrIdx   = headers.indexOf("Address");
-  const routeIdx  = headers.indexOf("routeDescription");
-
-  const addresses = Object.values(personStops).map(rows => {
-    const r   = rows[0];
-    const raw = addrIdx !== -1 ? String(r[addrIdx] || "").trim() : "";
-    // Strip route name segment from address
-    const routeName = routeIdx !== -1 ? String(r[routeIdx] || "").trim() : route;
-    return raw.split(",").map(p => p.trim()).filter(p => p !== routeName).join(", ");
-  }).filter(a => a.length > 0);
-
-  if (addresses.length === 0) return { link: "", label: "" };
-
-  const url      = buildAutoMapUrl(addresses, ""); // already stripped above
-  const short    = url ? shortenUrlForTyping(url) : "";
-  const link     = short || url;
-  const label    = `Map: ${route}`;
-
-  return { link, label, fullUrl: url, shortUrl: short };
 }
 
 /* -------------------------
@@ -649,7 +602,9 @@ function writeRouteIndexSheet(ss, indexSheetName, summaryRows) {
   indexSheet.getRange(1, 1, 1, summaryRows[0].length)
     .setFontWeight("bold").setBackground("#F0F0F0").setHorizontalAlignment("center");
   indexSheet.autoResizeColumns(1, summaryRows[0].length);
-  indexSheet.setColumnWidth(summaryRows[0].length, 120);
+  // Make the Map column a bit wider so "View Map" links are easy to click
+  const mapCol = summaryRows[0].length;
+  indexSheet.setColumnWidth(mapCol, 120);
 }
 
 /* -------------------------
@@ -4013,31 +3968,30 @@ function onOpen() {
   const ui = SpreadsheetApp.getUi();
 
   ui.createMenu("📦 Distribution Day Tasks")
-    .addItem("1. Filter Data for Map (Col I)",          "filterForMapCreation")
-    .addItem("2. Clear Map Data Filter",                "clearMapFilter")
+    .addItem("1. Filter Data for Map (Col I)", "filterForMapCreation")
+    .addItem("2. Clear Map Data Filter", "clearMapFilter")
     .addSeparator()
-    .addItem("3. Make/Update Driver Route Tabs",        "makeDriverRouteTabs")
-    .addItem("4. Make/Update NaviDash",                 "makeNaviDash")
-    .addItem("5. Make/Update Packing Lists Tab",        "makePackingLists")
-    .addItem("6. Make/Update Delivery Labels Tab",      "makeTheLabels")
+    .addItem("3. Make/Update Driver Route Tabs", "makeDriverRouteTabs")
+    .addItem("4. Make/Update Packing Lists Tab", "makePackingLists")
+    .addItem("5. Make/Update Delivery Labels Tab", "makeTheLabels")
     .addSeparator()
-    .addItem("7. Export Route Tabs → PDF  (run 3 first)",      "makeDriverRouteTabsThenPDF")
-    .addItem("8. Make NaviDash then PDF",               "makeNaviDashThenPDF")
-    .addItem("9. Make Delivery Labels Tab then PDF",    "makeLabelsPDF")
-    .addToUi();
+    .addItem("6. Make Driver Route Tabs then PDF", "makeDriverRouteTabsThenPDF")
+    .addItem("7. Make Packing Lists Tab then PDF", "makePackingListThenPDF")
+    .addItem("8. Make Delivery Labels Tab then PDF", "makeLabelsPDF")
+.addToUi();
 
+  // Label Generator: each item generates the sheet only (no PDF prompt).
+  // Use item 8 above or the PDF option below to also export.
   ui.createMenu("📦 Label Generator")
-    .addItem("Labels — Driver Names",                   "generateWithDrivers")
-    .addItem("Labels — Full Route Names",               "generateWithRoutes")
-    .addItem("Labels — Abbreviated Route Codes",        "generateWithAbbreviatedRoutes")
-    .addItem("Labels — No Route Info",                  "generateWithoutDrivers")
+    .addItem("Labels — Driver Names",          "generateWithDrivers")
+    .addItem("Labels — Full Route Names",       "generateWithRoutes")
+    .addItem("Labels — Abbreviated Route Codes","generateWithAbbreviatedRoutes")
+    .addItem("Labels — No Route Info",          "generateWithoutDrivers")
     .addSeparator()
-    .addItem("Labels — Choose Mode + Export PDF",       "makeLabelsPDF")
+    .addItem("Labels — Choose Mode + Export PDF","makeLabelsPDF")
     .addToUi();
 
   ui.createMenu("📦 Sheet Tools")
-    .addItem("Delete Route Sheets",                     "deleteSheetsByPrefix")
-    .addSeparator()
-    .addItem("⛔ Cancel Route Tab Generation",          "cancelDriverRouteTabs")
+    .addItem("Delete Route Sheets", "deleteSheetsByPrefix")
     .addToUi();
 }
